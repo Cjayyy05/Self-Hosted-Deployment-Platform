@@ -50,11 +50,16 @@ vi.mock('../src/services/project-operation-lock.service.js', () => ({
 import { createApp } from '../src/app.js';
 import { createAccessToken } from '../src/services/token.service.js';
 
+vi.hoisted(() => {
+  process.env.CADDY_ADMIN_SOCKET = '';
+});
+
 const userId = '352bd66d-41b7-4c0d-a148-8a236647677b';
 const projectId = 'a382fb3d-dce4-4470-8e41-89a181466ce8';
 const now = new Date('2026-09-03T00:00:00.000Z');
 const project = {
   id: projectId,
+  hostnameLabel: 'app-a382fb3ddce444708e4189a181466ce8',
   userId,
   name: 'Example API',
   repositoryUrl: 'https://github.com/example/example-api',
@@ -108,6 +113,7 @@ describe('POST /api/projects', () => {
     expect(response.body).toEqual({
       project: {
         ...project,
+        localApplicationUrl: null,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
       },
@@ -116,7 +122,10 @@ describe('POST /api/projects', () => {
       data: Record<string, unknown>;
       select: unknown;
     };
+    expect(createArgs.data.id).toMatch(/^[a-f0-9-]{36}$/);
     expect(createArgs.data).toEqual({
+      id: createArgs.data.id,
+      hostnameLabel: 'app-' + String(createArgs.data.id).replaceAll('-', ''),
       userId,
       name: 'Example API',
       repositoryUrl: 'https://github.com/example/example-api',
@@ -232,6 +241,7 @@ describe('GET /api/projects', () => {
       projects: [
         {
           ...project,
+          localApplicationUrl: null,
           createdAt: now.toISOString(),
           updatedAt: now.toISOString(),
         },

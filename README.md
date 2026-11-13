@@ -240,6 +240,9 @@ Never commit `backend/.env` or `frontend/.env.local`. Both are ignored by the re
 | `REGISTRATION_ENABLED` | Enables or disables new account registration | `false` |
 | `GITHUB_WEBHOOK_SECRET_KEY` | Master key used to derive a stable per-project webhook secret | Independent random value of at least 32 bytes; webhooks are unavailable when omitted |
 | `PUBLIC_BASE_URL` | Public backend origin used to form webhook payload URLs | `http://localhost:4000`; use an HTTPS tunnel origin for real GitHub delivery |
+| `APP_HOSTING_ORIGIN` | Local HTTP origin used to derive reserved project addresses | `http://localhost:8080` |
+| `APP_HOSTNAME_SUFFIX` | DNS suffix for reserved project addresses | `localhost` |
+| `CADDY_ADMIN_SOCKET` | Opts into local hosting configuration using a private filesystem socket | Unset by default. See [Local hosting foundation](docs/local-hosting.md). |
 
 ### Frontend (`frontend/.env.local`)
 
@@ -310,7 +313,8 @@ The current implementation limits repository URLs to public GitHub HTTPS URLs, i
 - Automatic detection is intentionally narrow: npm projects with a start script and specific root-level Flask, FastAPI, or Streamlit layouts.
 - The configured Node application must honor conventional `HOST` and `PORT` environment variables; custom startup layouts may need their own Dockerfile.
 - One Docker host and one backend process; there is no distributed queue, multi-host scheduler, or high-availability coordination.
-- No Kubernetes, autoscaling, custom-domain routing, managed TLS, or built-in reverse proxy.
+- Local hosting optionally routes healthy deployments through Caddy at a stable project URL. The dashboard still uses its existing Docker port link. See [Local hosting](docs/local-hosting.md).
+- No Kubernetes, autoscaling, custom-domain routing, or managed TLS.
 - No production-grade sandboxing, container CPU/memory limits, network isolation policy, image scanning, or build quotas.
 - Live deployment events are not persisted or replayed. The logs panel receives only events emitted after it subscribes, although container logs can be retrieved through the API.
 - Runtime monitoring exposes current Docker statistics only; it does not store historical metrics.

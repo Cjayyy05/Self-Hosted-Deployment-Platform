@@ -97,6 +97,50 @@ describe('ContainerService', () => {
     };
   });
 
+  describe('routing binding inspection', () => {
+    const input = { containerId, deploymentId, containerPort: 8080 };
+    const bindings = [{ HostIp: '127.0.0.1', HostPort: '49153' }];
+    const verified = {
+      ...runningInspectResult,
+      Config: { Labels: { 'deployflow.deployment-id': deploymentId } },
+      NetworkSettings: { Ports: { '8080/tcp': bindings } },
+    };
+
+    beforeEach(() => {
+      docker.modem = {
+        getSocketPath: () => process.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock',
+      };
+      container.inspect.mockResolvedValue(verified);
+    });
+
+    it('uses the inspected binding from the verified running container', async () => {
+      await expect(new ContainerService(docker).inspectLoopbackRoutingPort(input)).resolves.toBe(49153);
+      expect(docker.getContainer).toHaveBeenCalledWith(containerId);
+    });
+
+    it.each([
+      { ...verified, Id: 'b'.repeat(64) },
+      { ...verified, Config: { Labels: {} } },
+      { ...verified, State: stoppedInspectResult.State },
+      { ...verified, State: { Status: 'paused', Running: true } },
+      { ...verified, NetworkSettings: runningInspectResult.NetworkSettings },
+      { ...verified, NetworkSettings: { Ports: { '8080/tcp': [...bindings, ...bindings] } } },
+      { ...verified, NetworkSettings: { Ports: { '8080/tcp': [{ ...bindings[0], HostPort: '65536' }] } } },
+    ])('rejects an unsafe or invalid Docker inspection', async (details) => {
+      container.inspect.mockResolvedValue(details);
+      await expect(new ContainerService(docker).inspectLoopbackRoutingPort(input)).rejects.toThrow();
+    });
+
+    it('rejects short IDs and nonlocal Docker transports before inspecting', async () => {
+      const service = new ContainerService(docker);
+      await expect(service.inspectLoopbackRoutingPort({ ...input, containerId: 'a'.repeat(12) }))
+        .rejects.toThrow('full Docker container ID');
+      docker.modem = {};
+      await expect(service.inspectLoopbackRoutingPort(input)).rejects.toThrow('local Docker socket');
+      expect(docker.getContainer).not.toHaveBeenCalled();
+    });
+  });
+
   it('creates and starts a container with a Docker-assigned host port', async () => {
     const service = new ContainerService(docker);
 

@@ -1,9 +1,11 @@
 import 'dotenv/config';
 
 import { isIP } from 'node:net';
+import { posix, win32 } from 'node:path';
 
 const DEFAULT_PORT = 4000;
 const DEFAULT_BIND_HOST = '127.0.0.1';
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const JWT_SECRET_EXAMPLE = 'replace-with-at-least-32-random-characters';
 const WEBHOOK_SECRET_EXAMPLE =
   'replace-with-a-different-32-character-random-secret';
@@ -131,11 +133,73 @@ const parsePublicBaseUrl = (
   return url.origin;
 };
 
+export type HostingConfig = Readonly<{
+  origin: string;
+  hostnameSuffix: string;
+  adminSocketPath: string | undefined;
+}>;
+
+export const parseCaddyAdminSocketPath = (
+  value: string,
+  platform: NodeJS.Platform = process.platform,
+): string => {
+  const windows = platform === 'win32';
+  const absolute = windows
+    ? /^[a-z]:[\\/]/i.test(value) && !/[:*?"<>]/.test(value.slice(2))
+    : /^\/[^/]/.test(value);
+  const path = windows ? win32.normalize(value) : posix.normalize(value);
+  if (
+    !absolute ||
+    value.includes('|') ||
+    Array.from(value).some((character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127) ||
+    value.split(windows ? /[\\/]/ : '/').some((part) => part === '.' || part === '..') ||
+    path.endsWith(windows ? '\\' : '/') ||
+    Buffer.byteLength(path) > 107
+  ) {
+    throw new Error('CADDY_ADMIN_SOCKET must be an absolute local Unix socket file path of at most 107 bytes');
+  }
+  return path;
+};
+
+export const parseHostingConfig = (
+  input: {
+    origin?: string | undefined;
+    hostnameSuffix?: string | undefined;
+    adminSocketPath?: string | undefined;
+  },
+  platform: NodeJS.Platform = process.platform,
+): HostingConfig => {
+  const origin = input.origin?.trim() ?? 'http://localhost:8080';
+  const match = /^http:\/\/(localhost|127\.0\.0\.1)(?::([1-9]\d{0,4}))?\/?$/.exec(origin);
+  if (match === null || (match[2] !== undefined && Number(match[2]) > 65_535)) {
+    throw new Error('APP_HOSTING_ORIGIN must be a local HTTP origin on localhost or 127.0.0.1');
+  }
+  const hostnameSuffix = input.hostnameSuffix?.trim().toLowerCase() ?? 'localhost';
+  if (
+    hostnameSuffix.length > 216 ||
+    isIP(hostnameSuffix) !== 0 ||
+    !hostnameSuffix.split('.').every((label) => DNS_LABEL.test(label))
+  ) {
+    throw new Error('APP_HOSTNAME_SUFFIX must be a DNS suffix that fits after a project label');
+  }
+  const socket = input.adminSocketPath?.trim();
+  return Object.freeze({
+    origin: new URL(origin).origin,
+    hostnameSuffix,
+    adminSocketPath: socket ? parseCaddyAdminSocketPath(socket, platform) : undefined,
+  });
+};
+
 const port = parsePort(process.env.PORT);
 const nodeEnv = parseNodeEnv(process.env.NODE_ENV);
 
 export const env = Object.freeze({
   bindHost: parseBindHost(process.env.BIND_HOST),
+  hosting: parseHostingConfig({
+    origin: process.env.APP_HOSTING_ORIGIN,
+    hostnameSuffix: process.env.APP_HOSTNAME_SUFFIX,
+    adminSocketPath: process.env.CADDY_ADMIN_SOCKET,
+  }),
   databaseUrl: requireValue('DATABASE_URL', process.env.DATABASE_URL),
   githubWebhookSecretKey: parseWebhookSecretKey(
     process.env.GITHUB_WEBHOOK_SECRET_KEY,

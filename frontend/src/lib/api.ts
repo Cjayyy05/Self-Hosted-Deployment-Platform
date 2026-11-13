@@ -9,6 +9,8 @@ export type AuthUser = {
 
 export type Project = {
   id: string;
+  hostnameLabel: string;
+  localApplicationUrl: string | null;
   userId: string;
   name: string;
   repositoryUrl: string;

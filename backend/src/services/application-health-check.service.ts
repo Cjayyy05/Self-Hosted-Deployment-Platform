@@ -10,12 +10,14 @@ const DEFAULT_RETRY_DELAY_MS = 1_000;
 export type ApplicationHealthCheckInput = {
   hostPort: number;
   path: string;
+  hostname?: string;
 };
 
 export type LocalHealthRequest = (input: {
   hostPort: number;
   path: string;
   timeoutMs: number;
+  hostname?: string;
 }) => Promise<number>;
 
 type ApplicationHealthCheckDependencies = {
@@ -30,6 +32,7 @@ const requestLocalHealth: LocalHealthRequest = ({
   hostPort,
   path,
   timeoutMs,
+  hostname,
 }) =>
   new Promise((resolve, reject) => {
     const healthRequest = request(
@@ -38,7 +41,11 @@ const requestLocalHealth: LocalHealthRequest = ({
         port: hostPort,
         path,
         method: 'GET',
-        headers: { Accept: '*/*', 'User-Agent': 'DeployFlow-HealthCheck/1.0' },
+        headers: {
+          Accept: '*/*',
+          'User-Agent': 'DeployFlow-HealthCheck/1.0',
+          ...(hostname === undefined ? {} : { Host: hostname }),
+        },
       },
       (response) => {
         response.resume();
@@ -85,6 +92,13 @@ export class ApplicationHealthCheckService {
   ): Promise<void> {
     const hostPort = parseHostPort(input.hostPort);
     const path = parseHealthCheckPath(input.path);
+    if (
+      input.hostname !== undefined &&
+      (input.hostname.length > 253 ||
+        !/^app-[a-f0-9]{32}(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/.test(input.hostname))
+    ) {
+      throw new AppError(400, 'Application health-check hostname is invalid');
+    }
 
     for (let attempt = 1; attempt <= this.#maxAttempts; attempt += 1) {
       try {
@@ -92,6 +106,7 @@ export class ApplicationHealthCheckService {
           hostPort,
           path,
           timeoutMs: this.#requestTimeoutMs,
+          ...(input.hostname === undefined ? {} : { hostname: input.hostname }),
         });
         if (statusCode >= 200 && statusCode < 400) return;
       } catch {

@@ -26,6 +26,15 @@ enum ApplicationType {
   PYTHON
 }
 
+enum RoutingOperation {
+  PROMOTE
+  ABORT
+  RETIRE
+  STOP
+  RESTART
+  DELETE
+}
+
 model User {
   id           String    @id @default(uuid()) @db.Uuid
   email        String    @unique @db.VarChar(320)
@@ -37,6 +46,7 @@ model User {
 
 model Project {
   id                String                  @id @default(uuid()) @db.Uuid
+  hostnameLabel     String                  @unique @db.VarChar(36)
   userId            String                  @db.Uuid
   name              String                  @db.VarChar(100)
   repositoryUrl     String
@@ -45,10 +55,15 @@ model Project {
   healthCheckPath   String                  @default("/") @db.VarChar(1024)
   operationLockToken String?                @db.Uuid
   operationLockExpiresAt DateTime?
+  activeDeploymentId String?               @db.Uuid
+  routingOperation   RoutingOperation?
+  routingDeploymentId String?              @db.Uuid
   createdAt         DateTime                @default(now())
   updatedAt         DateTime                @updatedAt
   user              User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   deployments       Deployment[]
+  activeDeployment  Deployment?             @relation("ActiveDeployment", fields: [id, activeDeploymentId], references: [projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  routingDeployment Deployment?             @relation("RoutingDeployment", fields: [id, routingDeploymentId], references: [projectId, id], onDelete: NoAction, onUpdate: NoAction)
   webhookDeliveries GitHubWebhookDelivery[]
 
   @@index([userId])
@@ -84,7 +99,10 @@ model Deployment {
   project                    Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
   rollbackSource             Deployment?      @relation("DeploymentRollbacks", fields: [rollbackSourceDeploymentId], references: [id], onDelete: SetNull)
   rollbacks                  Deployment[]     @relation("DeploymentRollbacks")
+  activeFor                  Project[]        @relation("ActiveDeployment")
+  routingFor                 Project[]        @relation("RoutingDeployment")
 
+  @@unique([projectId, id])
   @@index([projectId])
   @@index([status])
   @@index([rollbackSourceDeploymentId])

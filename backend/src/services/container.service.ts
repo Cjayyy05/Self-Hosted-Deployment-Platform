@@ -28,6 +28,12 @@ export type StartContainerResult = ContainerRuntimeStatus & {
   hostPort: number;
 };
 
+export type RoutingContainer = {
+  containerId: string;
+  deploymentId: string;
+  containerPort: number;
+};
+
 export type ContainerLogsOptions = {
   tail?: number;
   timestamps?: boolean;
@@ -67,6 +73,7 @@ export type ContainerCreateOptions = {
 
 type ContainerInspectResult = {
   Id?: unknown;
+  Config?: { Labels?: Record<string, unknown> | null };
   State?: {
     Status?: unknown;
     Running?: unknown;
@@ -96,6 +103,7 @@ export type DockerContainer = {
 };
 
 export type DockerClient = {
+  modem?: { getSocketPath?: () => Promise<string | undefined> | string | undefined };
   createContainer: (options: ContainerCreateOptions) => Promise<DockerContainer>;
   getContainer: (id: string) => DockerContainer;
 };
@@ -374,6 +382,47 @@ export class ContainerService {
       return readRuntimeStatus(await container.inspect(), container.id);
     } catch (error: unknown) {
       throw toOperationError(error, 'Unable to inspect container status');
+    }
+  }
+
+  public async inspectLoopbackRoutingPort(input: RoutingContainer): Promise<number> {
+    if (!/^[a-f0-9]{64}$/i.test(input.containerId)) {
+      throw new AppError(400, 'Routing requires a full Docker container ID');
+    }
+    if (!UUID_PATTERN.test(input.deploymentId)) {
+      throw new AppError(400, 'Deployment ID must be a valid UUID');
+    }
+    const containerId = input.containerId.toLowerCase();
+    const containerPort = parseContainerPort(input.containerPort);
+
+    try {
+      const socket = await this.#docker.modem?.getSocketPath?.();
+      const local = socket !== undefined && (process.platform === 'win32'
+        ? /^\/\/\.\/pipe\/[a-z0-9_.-]+$/i.test(socket.replaceAll('\\', '/'))
+        : /^\/[^/]/.test(socket));
+      if (!local) throw new AppError(422, 'Routing requires a local Docker socket or named pipe');
+
+      const details = await this.#docker.getContainer(containerId).inspect();
+      if (
+        details.Id !== containerId ||
+        details.Config?.Labels?.['deployflow.deployment-id'] !== input.deploymentId.toLowerCase() ||
+        details.State?.Running !== true ||
+        details.State.Status !== 'running'
+      ) {
+        throw new AppError(422, 'Docker did not verify the running deployment container');
+      }
+      const bindings = details.NetworkSettings?.Ports?.[`${String(containerPort)}/tcp`];
+      if (
+        !Array.isArray(bindings) ||
+        bindings.length !== 1 ||
+        !isRecord(bindings[0]) ||
+        bindings[0].HostIp !== '127.0.0.1'
+      ) {
+        throw new AppError(422, 'Routing requires exactly one IPv4 loopback binding');
+      }
+      return readHostPort(details, containerPort);
+    } catch (error: unknown) {
+      throw toOperationError(error, 'Unable to verify Docker routing binding');
     }
   }
 

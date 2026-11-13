@@ -20,8 +20,13 @@ export type ProjectOperationLockDatabase = {
 export type ProjectOperationLock = {
   runExclusive: <T>(
     projectId: string,
-    operation: () => Promise<T>,
+    operation: (lease?: ProjectOperationLease) => Promise<T>,
   ) => Promise<T>;
+};
+
+export type ProjectOperationLease = {
+  token: string;
+  assertValid: () => Promise<void>;
 };
 
 type ProjectOperationLockDependencies = {
@@ -38,6 +43,7 @@ export class ProjectOperationLockService implements ProjectOperationLock {
   readonly #createToken: () => string;
   readonly #leaseDurationMs: number;
   readonly #renewalIntervalMs: number;
+  readonly #active = new Set<string>();
 
   public constructor(dependencies: ProjectOperationLockDependencies = {}) {
     this.#database = dependencies.database ?? database;
@@ -51,18 +57,31 @@ export class ProjectOperationLockService implements ProjectOperationLock {
 
   public async runExclusive<T>(
     projectId: string,
-    operation: () => Promise<T>,
+    operation: (lease?: ProjectOperationLease) => Promise<T>,
   ): Promise<T> {
     const token = this.#createToken();
-    const acquired = await this.#acquire(projectId, token);
-
-    if (!acquired) {
+    if (this.#active.has(projectId)) {
       throw new AppError(
         409,
         'Another deployment operation is already active for this project',
       );
     }
+    this.#active.add(projectId);
+    try {
+      if (!await this.#acquire(projectId, token)) {
+        throw new AppError(409, 'Another deployment operation is already active for this project');
+      }
+      return await this.#runHeld(projectId, token, operation);
+    } finally {
+      this.#active.delete(projectId);
+    }
+  }
 
+  async #runHeld<T>(
+    projectId: string,
+    token: string,
+    operation: (lease?: ProjectOperationLease) => Promise<T>,
+  ): Promise<T> {
     let renewalInProgress = false;
     const renewalTimer = setInterval(() => {
       if (renewalInProgress) return;
@@ -74,7 +93,14 @@ export class ProjectOperationLockService implements ProjectOperationLock {
     renewalTimer.unref();
 
     try {
-      return await operation();
+      return await operation({
+        token,
+        assertValid: async () => {
+          if (!await this.#renew(projectId, token)) {
+            throw new AppError(409, 'Project operation lease could not be verified');
+          }
+        },
+      });
     } finally {
       clearInterval(renewalTimer);
       await this.#release(projectId, token);
@@ -107,20 +133,21 @@ export class ProjectOperationLockService implements ProjectOperationLock {
     }
   }
 
-  async #renew(projectId: string, token: string): Promise<void> {
+  async #renew(projectId: string, token: string): Promise<boolean> {
     const now = this.#now();
 
     try {
-      await this.#database.project.updateMany({
-        where: { id: projectId, operationLockToken: token },
+      const result = await this.#database.project.updateMany({
+        where: { id: projectId, operationLockToken: token, operationLockExpiresAt: { gt: now } },
         data: {
           operationLockExpiresAt: new Date(
             now.getTime() + this.#leaseDurationMs,
           ),
         },
       });
+      return result.count === 1;
     } catch {
-      // The existing lease remains valid and will eventually expire safely.
+      return false;
     }
   }
 

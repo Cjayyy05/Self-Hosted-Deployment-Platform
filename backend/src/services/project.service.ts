@@ -1,6 +1,11 @@
+import { randomUUID } from 'node:crypto';
+
 import { database } from '../config/database.js';
+import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
+import { localProjectUrl, projectHostnameLabel } from '../utils/project-hostname.js';
 import { containerService } from './container.service.js';
+import { deploymentRoutingService, requireRoutingLease } from './deployment-routing.service.js';
 import { dockerBuildService } from './docker-build.service.js';
 import { projectOperationLockService } from './project-operation-lock.service.js';
 
@@ -14,6 +19,7 @@ type CreateProjectData = {
 
 const projectSelect = {
   id: true,
+  hostnameLabel: true,
   userId: true,
   name: true,
   repositoryUrl: true,
@@ -24,21 +30,33 @@ const projectSelect = {
   updatedAt: true,
 } as const;
 
+const withLocalApplicationUrl = <T extends { hostnameLabel: string }>(project: T) => ({
+  ...project,
+  localApplicationUrl: env.hosting.adminSocketPath === undefined
+    ? null
+    : localProjectUrl(project.hostnameLabel, env.hosting),
+});
+
 export const createProject = async (
   userId: string,
   data: CreateProjectData,
-) =>
-  database.project.create({
-    data: { ...data, userId },
+) => {
+  const id = randomUUID();
+  const project = await database.project.create({
+    data: { ...data, id, hostnameLabel: projectHostnameLabel(id), userId },
     select: projectSelect,
   });
+  return withLocalApplicationUrl(project);
+};
 
-export const listProjects = async (userId: string) =>
-  database.project.findMany({
+export const listProjects = async (userId: string) => {
+  const projects = await database.project.findMany({
     where: { userId },
     select: projectSelect,
     orderBy: { createdAt: 'desc' },
   });
+  return projects.map(withLocalApplicationUrl);
+};
 
 export const getProject = async (userId: string, projectId: string) => {
   const project = await database.project.findFirst({
@@ -50,7 +68,7 @@ export const getProject = async (userId: string, projectId: string) => {
     throw new AppError(404, 'Project not found');
   }
 
-  return project;
+  return withLocalApplicationUrl(project);
 };
 
 export const updateProjectHealthCheck = async (
@@ -70,26 +88,28 @@ export const updateProjectHealthCheck = async (
   return getProject(userId, projectId);
 };
 
-export const deleteProject = async (
-  userId: string,
+const deleteProjectDockerResources = async (
   projectId: string,
+  activeContainerId: string | null,
+  assertSafe: () => Promise<void>,
 ): Promise<void> => {
-  await getProject(userId, projectId);
-
-  await projectOperationLockService.runExclusive(projectId, async () => {
-    const deployments = await database.deployment.findMany({
+  const deployments = await database.deployment.findMany({
       where: { projectId },
       select: {
         containerId: true,
         imageTag: true,
       },
-    });
+  });
 
-    const containerIds = new Set(
+  const containerIds = new Set(
       deployments.flatMap(({ containerId }) =>
         containerId === null ? [] : [containerId],
       ),
-    );
+  );
+  if (activeContainerId !== null) {
+    containerIds.delete(activeContainerId);
+    containerIds.add(activeContainerId);
+  }
 
     try {
       for (const containerId of containerIds) {
@@ -103,8 +123,10 @@ export const deleteProject = async (
         }
 
         if (status.running) {
+          await assertSafe();
           await containerService.stopContainer(containerId);
         }
+        await assertSafe();
         await containerService.removeContainer(containerId);
       }
 
@@ -116,6 +138,7 @@ export const deleteProject = async (
 
       for (const imageTag of imageTags) {
         if (await dockerBuildService.imageExists(imageTag)) {
+          await assertSafe();
           await dockerBuildService.removeImage(imageTag);
         }
       }
@@ -126,12 +149,41 @@ export const deleteProject = async (
       );
     }
 
-    const result = await database.project.deleteMany({
-      where: { id: projectId, userId },
-    });
+};
 
-    if (result.count === 0) {
-      throw new AppError(404, 'Project not found');
+export const deleteProject = async (
+  userId: string,
+  projectId: string,
+): Promise<void> => {
+  await getProject(userId, projectId);
+
+  await projectOperationLockService.runExclusive(projectId, async (lease) => {
+    const routing = deploymentRoutingService;
+    const hosted = routing === undefined ? undefined : requireRoutingLease(lease);
+    const deletion = routing === undefined || hosted === undefined
+      ? null
+      : await routing.beginDelete(projectId, hosted);
+    const assertSafe = async () => {
+      if (routing !== undefined && hosted !== undefined) await routing.assertWithdrawn(projectId, hosted);
+    };
+    try {
+      await deleteProjectDockerResources(projectId, deletion?.containerId ?? null, assertSafe);
+      await assertSafe();
+      const result = await database.project.deleteMany({
+        where: {
+          id: projectId, userId,
+          ...(hosted === undefined || deletion === null ? {} : {
+            operationLockToken: hosted.token, operationLockExpiresAt: { gt: new Date() },
+            activeDeploymentId: deletion.deploymentId,
+            routingDeploymentId: deletion.deploymentId,
+            routingOperation: deletion.deploymentId === null ? null : 'DELETE',
+          }),
+        },
+      });
+      if (result.count === 0) throw new AppError(404, 'Project not found');
+    } catch (error) {
+      if (routing !== undefined && hosted !== undefined && !await routing.deleteFailed(projectId, hosted)) return;
+      throw error;
     }
   });
 };

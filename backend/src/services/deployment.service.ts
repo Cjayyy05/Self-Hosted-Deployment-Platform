@@ -15,6 +15,12 @@ import {
   type DockerBuildResult,
 } from './docker-build.service.js';
 import {
+  deploymentRoutingService,
+  requireRoutingLease,
+  RoutingPendingError,
+  type DeploymentRoutingService,
+} from './deployment-routing.service.js';
+import {
   containerService,
   type ContainerCpuStatistics,
   type ContainerMemoryStatistics,
@@ -28,6 +34,7 @@ import {
 import {
   projectOperationLockService,
   type ProjectOperationLock,
+  type ProjectOperationLease,
 } from './project-operation-lock.service.js';
 
 const UUID_PATTERN =
@@ -203,6 +210,7 @@ export type DeploymentServiceDependencies = {
   buildService?: DeploymentBuildService;
   containerService?: DeploymentContainerService;
   operationLock?: ProjectOperationLock;
+  routing?: Pick<DeploymentRoutingService, 'assertIdle' | 'promote' | 'stop' | 'beginRestart' | 'restartFailed'>;
   now?: () => Date;
 };
 
@@ -258,6 +266,7 @@ export class DeploymentService {
   readonly #buildService: DeploymentBuildService;
   readonly #containerService: DeploymentContainerService;
   readonly #operationLock: ProjectOperationLock;
+  readonly #routing: DeploymentServiceDependencies['routing'];
   readonly #now: () => Date;
 
   public constructor(dependencies: DeploymentServiceDependencies = {}) {
@@ -272,6 +281,7 @@ export class DeploymentService {
       dependencies.containerService ?? containerService;
     this.#operationLock =
       dependencies.operationLock ?? projectOperationLockService;
+    this.#routing = dependencies.routing ?? deploymentRoutingService;
     this.#now = dependencies.now ?? (() => new Date());
   }
 
@@ -282,8 +292,8 @@ export class DeploymentService {
   ): Promise<DeploymentRecord> {
     const projectId = parseIdentifier(rawProjectId, 'Project ID');
     await this.#getOwnedProject(userId, projectId);
-    return this.#operationLock.runExclusive(projectId, () =>
-      this.deployProject(projectId, onEvent),
+    return this.#operationLock.runExclusive(projectId, (lease) =>
+      this.#deployProjectUnlocked(projectId, onEvent, lease),
     );
   }
 
@@ -320,8 +330,8 @@ export class DeploymentService {
       userId,
       parseIdentifier(rawDeploymentId, 'Deployment ID'),
     );
-    return this.#operationLock.runExclusive(deployment.projectId, () =>
-      this.#stopOwnedDeployment(deployment, onEvent),
+    return this.#operationLock.runExclusive(deployment.projectId, (lease) =>
+      this.#stopOwnedDeployment(deployment, onEvent, lease),
     );
   }
 
@@ -334,19 +344,24 @@ export class DeploymentService {
       userId,
       parseIdentifier(rawDeploymentId, 'Deployment ID'),
     );
-    return this.#operationLock.runExclusive(deployment.projectId, () =>
-      this.#restartOwnedDeployment(deployment, onEvent),
+    return this.#operationLock.runExclusive(deployment.projectId, (lease) =>
+      this.#restartOwnedDeployment(deployment, onEvent, lease),
     );
   }
 
   async #restartOwnedDeployment(
     deployment: OwnedDeployment,
     onEvent: DeploymentEventCallback | undefined,
+    lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
     const containerId = this.#requireContainerId(deployment);
     let containerRestarted = false;
+    const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
+    const shouldRoute = hostingLease !== undefined &&
+      await this.#routing?.beginRestart(deployment.projectId, deployment.id, hostingLease);
 
     try {
+      await hostingLease?.assertValid();
       await this.#updateDeployment(deployment.id, {
         status: DeploymentStatus.STARTING,
       });
@@ -360,6 +375,7 @@ export class DeploymentService {
         deployment.project.containerPort,
       );
       containerRestarted = true;
+      await hostingLease?.assertValid();
       await this.#updateDeployment(deployment.id, {
         hostPort: restartedContainer.hostPort,
       });
@@ -378,7 +394,14 @@ export class DeploymentService {
         hostPort: restartedContainer.hostPort,
         path: deployment.project.healthCheckPath,
       });
-      const runningDeployment = await this.#updateDeployment(deployment.id, {
+      await hostingLease?.assertValid();
+      const runningDeployment = shouldRoute && this.#routing !== undefined
+        ? await this.#routing.promote(
+          { ...deployment, hostPort: restartedContainer.hostPort },
+          this.#now(),
+          requireRoutingLease(hostingLease),
+        )
+        : await this.#updateDeployment(deployment.id, {
         status: DeploymentStatus.RUNNING,
         hostPort: restartedContainer.hostPort,
         startedAt: this.#now(),
@@ -392,11 +415,15 @@ export class DeploymentService {
       });
       return runningDeployment;
     } catch (error: unknown) {
+      if (error instanceof RoutingPendingError) throw error;
+      const handled = hostingLease !== undefined &&
+        await this.#routing?.restartFailed(deployment.projectId, deployment.id, hostingLease);
       const errorMessage =
         error instanceof AppError ? error.message : 'Unable to restart deployment';
 
-      if (containerRestarted) {
+      if (containerRestarted && !handled) {
         try {
+          await hostingLease?.assertValid();
           await this.#containerService.stopContainer(containerId);
         } catch {
           // Preserve the health-check or restart failure.
@@ -439,10 +466,11 @@ export class DeploymentService {
     );
     return this.#operationLock.runExclusive(
       previousDeployment.projectId,
-      () =>
+      (lease) =>
         this.#deployProjectReplacingRunningUnlocked(
           previousDeployment.projectId,
           onEvent,
+          lease,
         ),
     );
   }
@@ -468,8 +496,8 @@ export class DeploymentService {
       );
     }
 
-    return this.#operationLock.runExclusive(sourceDeployment.projectId, () =>
-      this.#executeRollback(sourceDeployment, onEvent),
+    return this.#operationLock.runExclusive(sourceDeployment.projectId, (lease) =>
+      this.#executeRollback(sourceDeployment, onEvent, lease),
     );
   }
 
@@ -478,22 +506,21 @@ export class DeploymentService {
     onEvent?: DeploymentEventCallback,
   ): Promise<DeploymentRecord> {
     const projectId = parseIdentifier(rawProjectId, 'Project ID');
-    return this.#operationLock.runExclusive(projectId, () =>
-      this.#deployProjectReplacingRunningUnlocked(projectId, onEvent),
+    return this.#operationLock.runExclusive(projectId, (lease) =>
+      this.#deployProjectReplacingRunningUnlocked(projectId, onEvent, lease),
     );
   }
 
   async #deployProjectReplacingRunningUnlocked(
     projectId: string,
     onEvent: DeploymentEventCallback | undefined,
+    lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
-    const newDeployment = await this.deployProject(projectId, onEvent);
+    const newDeployment = await this.#deployProjectUnlocked(projectId, onEvent, lease);
 
-    await this.#stopPreviousRunningDeployments(
-      projectId,
-      newDeployment.id,
-      onEvent,
-    );
+    if (this.#routing === undefined) {
+      await this.#stopPreviousRunningDeployments(projectId, newDeployment.id, onEvent);
+    }
 
     return newDeployment;
   }
@@ -501,11 +528,21 @@ export class DeploymentService {
   async #stopOwnedDeployment(
     deployment: OwnedDeployment,
     onEvent: DeploymentEventCallback | undefined,
+    lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
     const containerId = this.#requireContainerId(deployment);
 
     try {
+      if (this.#routing !== undefined) {
+        const hosted = await this.#routing.stop(deployment.projectId, deployment.id, requireRoutingLease(lease));
+        if (hosted !== null) {
+          this.#emit(onEvent, { type: 'status', deploymentId: hosted.id, status: DeploymentStatus.STOPPED });
+          return hosted;
+        }
+        await requireRoutingLease(lease).assertValid();
+      }
       await this.#containerService.stopContainer(containerId);
+      if (this.#routing !== undefined) await requireRoutingLease(lease).assertValid();
       const stoppedDeployment = await this.#updateDeployment(deployment.id, {
         status: DeploymentStatus.STOPPED,
         finishedAt: this.#now(),
@@ -556,6 +593,17 @@ export class DeploymentService {
     onEvent?: DeploymentEventCallback,
   ): Promise<DeploymentRecord> {
     const projectId = parseIdentifier(rawProjectId, 'Project ID');
+    if (this.#routing === undefined) return this.#deployProjectUnlocked(projectId, onEvent);
+    return this.#operationLock.runExclusive(projectId, (lease) => this.#deployProjectUnlocked(projectId, onEvent, lease));
+  }
+
+  async #deployProjectUnlocked(
+    projectId: string,
+    onEvent: DeploymentEventCallback | undefined,
+    lease?: ProjectOperationLease,
+  ): Promise<DeploymentRecord> {
+    const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
+    if (hostingLease !== undefined) await this.#routing?.assertIdle(projectId, hostingLease);
     let project: DeploymentProject | null;
 
     try {
@@ -639,12 +687,14 @@ export class DeploymentService {
       });
 
       stage = DeploymentStatus.STARTING;
+      await hostingLease?.assertValid();
       deployment = await this.#changeStatus(deployment.id, stage, onEvent);
       startedContainer = await this.#containerService.startContainer({
         imageIdentifier: image.imageId,
         containerPort: project.containerPort,
         deploymentId: deployment.id,
       });
+      await hostingLease?.assertValid();
       deployment = await this.#updateDeployment(deployment.id, {
         containerId: startedContainer.containerId,
         hostPort: startedContainer.hostPort,
@@ -663,25 +713,32 @@ export class DeploymentService {
         path: project.healthCheckPath,
       });
 
+      if (this.#routing !== undefined) {
+        await this.#gitService.cleanup(repository.repositoryPath);
+        repository = undefined;
+        deployment = await this.#routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
+      } else {
+        stage = DeploymentStatus.RUNNING;
+        deployment = await this.#updateDeployment(deployment.id, {
+          status: stage, startedAt: this.#now(), finishedAt: null, errorMessage: null,
+        });
+      }
       stage = DeploymentStatus.RUNNING;
-      deployment = await this.#updateDeployment(deployment.id, {
-        status: stage,
-        startedAt: this.#now(),
-        finishedAt: null,
-        errorMessage: null,
-      });
       this.#emit(onEvent, {
         type: 'status',
         deploymentId: deployment.id,
         status: stage,
       });
 
-      await this.#gitService.cleanup(repository.repositoryPath);
-      repository = undefined;
+      if (repository !== undefined) {
+        await this.#gitService.cleanup(repository.repositoryPath);
+        repository = undefined;
+      }
 
       this.#emit(onEvent, { type: 'completed', deployment });
       return deployment;
     } catch (error: unknown) {
+      await this.#assertCleanupSafe(error, hostingLease, deployment.id, onEvent);
       const errorMessage = getSafeFailureMessage(error, stage);
       await this.#cleanupResources(repository, image, startedContainer);
 
@@ -714,7 +771,10 @@ export class DeploymentService {
   async #executeRollback(
     sourceDeployment: OwnedDeployment,
     onEvent: DeploymentEventCallback | undefined,
+    lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
+    const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
+    if (hostingLease !== undefined) await this.#routing?.assertIdle(sourceDeployment.projectId, hostingLease);
     const commitHash = sourceDeployment.commitHash;
 
     if (commitHash === null) {
@@ -829,12 +889,14 @@ export class DeploymentService {
       }
 
       stage = DeploymentStatus.STARTING;
+      await hostingLease?.assertValid();
       deployment = await this.#changeStatus(deployment.id, stage, onEvent);
       startedContainer = await this.#containerService.startContainer({
         imageIdentifier,
         containerPort: sourceDeployment.project.containerPort,
         deploymentId: deployment.id,
       });
+      await hostingLease?.assertValid();
       deployment = await this.#updateDeployment(deployment.id, {
         containerId: startedContainer.containerId,
         hostPort: startedContainer.hostPort,
@@ -853,13 +915,19 @@ export class DeploymentService {
         path: sourceDeployment.project.healthCheckPath,
       });
 
+      if (this.#routing !== undefined) {
+        if (repository !== undefined) {
+          await this.#gitService.cleanup(repository.repositoryPath);
+          repository = undefined;
+        }
+        deployment = await this.#routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
+      } else {
+        stage = DeploymentStatus.RUNNING;
+        deployment = await this.#updateDeployment(deployment.id, {
+          status: stage, startedAt: this.#now(), finishedAt: null, errorMessage: null,
+        });
+      }
       stage = DeploymentStatus.RUNNING;
-      deployment = await this.#updateDeployment(deployment.id, {
-        status: stage,
-        startedAt: this.#now(),
-        finishedAt: null,
-        errorMessage: null,
-      });
       this.#emit(onEvent, {
         type: 'status',
         deploymentId: deployment.id,
@@ -872,6 +940,7 @@ export class DeploymentService {
       }
 
     } catch (error: unknown) {
+      await this.#assertCleanupSafe(error, hostingLease, deployment.id, onEvent);
       const errorMessage = getSafeFailureMessage(error, stage);
       await this.#cleanupResources(
         repository,
@@ -904,11 +973,9 @@ export class DeploymentService {
       throw new AppError(statusCode, errorMessage);
     }
 
-    await this.#stopPreviousRunningDeployments(
-      sourceDeployment.projectId,
-      deployment.id,
-      onEvent,
-    );
+    if (this.#routing === undefined) {
+      await this.#stopPreviousRunningDeployments(sourceDeployment.projectId, deployment.id, onEvent);
+    }
 
     this.#emit(onEvent, { type: 'completed', deployment });
     return deployment;
@@ -1084,6 +1151,22 @@ export class DeploymentService {
       } catch {
         // Preserve the original deployment failure.
       }
+    }
+  }
+
+  async #assertCleanupSafe(
+    error: unknown,
+    lease: ProjectOperationLease | undefined,
+    deploymentId: string,
+    onEvent: DeploymentEventCallback | undefined,
+  ): Promise<void> {
+    try {
+      if (error instanceof RoutingPendingError) throw error;
+      await lease?.assertValid();
+    } catch {
+      const pending = new RoutingPendingError();
+      this.#emitLog(onEvent, deploymentId, 'deployment', pending.message);
+      throw pending;
     }
   }
 

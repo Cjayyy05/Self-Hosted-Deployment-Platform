@@ -4,7 +4,7 @@
 
 DeployFlow is a self-hosted deployment platform for trusted, public GitHub repositories. It builds a repository into a Docker image, runs the application in a Docker container, and provides deployment management and monitoring from a web interface. A root Dockerfile is preferred, while a conservative set of Dockerfile-free Node.js and Python web applications can use a temporary generated Dockerfile.
 
-This repository currently contains the backend foundation, PostgreSQL persistence schema, JWT-based authentication, authenticated project management, an internal GitHub repository preparation service, and an internal Docker image build service. Container execution and the frontend are future milestones.
+DeployFlow includes Docker deployment and a management dashboard. Optional local hosting serves healthy deployments through Caddy using a stable project hostname.
 
 ## MVP requirements
 
@@ -67,6 +67,8 @@ Each project has an application-relative health-check path, defaulting to `/`. P
 Health checks always target `127.0.0.1` and the host port dynamically assigned to the newly started container. DeployFlow does not follow redirects or accept a configurable health-check host, preventing the feature from becoming an arbitrary server-side request mechanism. Checks use a two-second request timeout and retry up to 20 times with a one-second delay.
 
 The successful lifecycle is `QUEUED → CLONING → BUILDING → STARTING → HEALTHCHECKING → RUNNING`. Restart also passes through `STARTING → HEALTHCHECKING → RUNNING`. During redeploy and rollback, the existing running deployment remains available until its replacement passes health checking. A failed check marks only the replacement `FAILED`, cleans its container and incomplete image where appropriate, and leaves the working deployment running.
+
+With local hosting enabled, a candidate also needs a verified route and successful request through the project hostname before PostgreSQL commits it as the active deployment. The committed deployment and any unfinished routing operation are stored on the project. Recovery uses this state to restore routes and resolves pending operations before stopping any container that could still be serving traffic.
 
 ## Security limitations
 

@@ -25,6 +25,10 @@ describe('ProjectOperationLockService', () => {
         if (requestedToken !== activeToken) {
           return Promise.resolve({ count: 0 });
         }
+        const validity = options.where.operationLockExpiresAt as { gt: Date } | undefined;
+        if (validity !== undefined && (expiresAt === null || expiresAt <= validity.gt)) {
+          return Promise.resolve({ count: 0 });
+        }
         activeToken =
           (options.data.operationLockToken as string | null | undefined) ??
           activeToken;
@@ -116,5 +120,16 @@ describe('ProjectOperationLockService', () => {
     await expect(
       service.runExclusive(projectId, () => Promise.resolve('recovered')),
     ).resolves.toBe('recovered');
+  });
+
+  it('does not let a held but expired lease authorize a routing write', async () => {
+    const { service, setNow } = createHarness();
+    await service.runExclusive(projectId, async (lease) => {
+      if (lease === undefined) throw new Error('Expected an operation lease');
+      await lease.assertValid();
+      setNow(new Date('2026-09-12T00:02:00.000Z'));
+      await expect(lease.assertValid()).rejects.toMatchObject({ statusCode: 409 });
+      await expect(service.runExclusive(projectId, () => Promise.resolve())).rejects.toMatchObject({ statusCode: 409 });
+    });
   });
 });

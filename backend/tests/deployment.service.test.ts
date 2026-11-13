@@ -11,9 +11,11 @@ import {
   type DeploymentGitService,
   type DeploymentHealthCheckService,
   type DeploymentRecord,
+  type DeploymentServiceDependencies,
 } from '../src/services/deployment.service.js';
-import type { ProjectOperationLock } from '../src/services/project-operation-lock.service.js';
+import type { ProjectOperationLease, ProjectOperationLock } from '../src/services/project-operation-lock.service.js';
 import { AppError } from '../src/utils/app-error.js';
+import { RoutingPendingError } from '../src/services/deployment-routing.service.js';
 
 const projectId = '11111111-1111-4111-8111-111111111111';
 const userId = '99999999-9999-4999-8999-999999999999';
@@ -233,12 +235,12 @@ describe('DeploymentService', () => {
     operationLock = {
       runExclusive: async <T>(
         _lockedProjectId: string,
-        operation: () => Promise<T>,
-      ): Promise<T> => operation(),
+        operation: (lease?: ProjectOperationLease) => Promise<T>,
+      ): Promise<T> => operation({ token: 'fixture', assertValid: () => Promise.resolve() }),
     };
   });
 
-  const createService = () =>
+  const createService = (routing?: DeploymentServiceDependencies['routing']) =>
     new DeploymentService({
       database,
       gitService,
@@ -248,7 +250,34 @@ describe('DeploymentService', () => {
       containerService,
       operationLock,
       now: () => now,
+      ...(routing === undefined ? {} : { routing }),
     });
+
+  const hostedRouting = () => ({
+    assertIdle: vi.fn().mockResolvedValue(undefined),
+    promote: vi.fn().mockRejectedValue(new RoutingPendingError()),
+    stop: vi.fn().mockResolvedValue(null),
+    beginRestart: vi.fn().mockResolvedValue(false),
+    restartFailed: vi.fn().mockResolvedValue(false),
+  });
+
+  it('retains the started container and image when hosted promotion is uncertain', async () => {
+    const routing = hostedRouting();
+    await expect(createService(routing).deployProject(projectId)).rejects.toMatchObject({ statusCode: 503 });
+    expect(routing.promote).toHaveBeenCalledOnce();
+    expect(waitUntilHealthy).toHaveBeenCalledBefore(routing.promote);
+    expect(removeContainer).not.toHaveBeenCalled();
+    expect(removeImage).not.toHaveBeenCalled();
+    expect(currentDeployment.status).toBe(DeploymentStatus.HEALTHCHECKING);
+  });
+
+  it('keeps a failed hosted candidate out of routing', async () => {
+    const routing = hostedRouting();
+    waitUntilHealthy.mockRejectedValueOnce(new AppError(422, 'Application did not become healthy'));
+    await expect(createService(routing).deployProject(projectId)).rejects.toMatchObject({ statusCode: 422 });
+    expect(routing.promote).not.toHaveBeenCalled();
+    expect(removeContainer).toHaveBeenCalledWith(containerId);
+  });
 
   const configureRedeployRecords = () => {
     const previousDeployment: DeploymentRecord = {
