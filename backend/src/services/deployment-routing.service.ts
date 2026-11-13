@@ -491,5 +491,7 @@ const reportRecoveryFailure = (id: string, error: unknown): void => {
   console.warn('Deployment routing needs reconciliation for project', id, reason);
 };
 
-const routes = createApplicationRoutingService();
-export const deploymentRoutingService = routes === undefined ? undefined : new DeploymentRoutingService(routes);
+export const applicationRoutingService = createApplicationRoutingService();
+export const deploymentRoutingService = applicationRoutingService === undefined
+  ? undefined
+  : new DeploymentRoutingService(applicationRoutingService);

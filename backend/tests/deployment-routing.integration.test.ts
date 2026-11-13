@@ -181,6 +181,20 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
     };
     const deploy = (id: string) => request(app).post('/api/projects/' + id + '/deploy').set('Authorization', auth);
     const action = (id: string, kind: string) => request(app).post('/api/deployments/' + id + '/' + kind).set('Authorization', auth);
+    const expectHosting = async (p: { id: string; host: string }, status: string, activeId: string | null, latest?: string) => {
+      await vi.waitFor(async () => {
+        const response = await request(app).get('/api/projects/' + p.id).set('Authorization', auth);
+        expect(response.status).toBe(200);
+        expect(response.body).toMatchObject({
+          project: {
+            localApplicationUrl: 'http://' + p.host + ':' + String(port),
+            hostingStatus: status,
+            activeDeployment: activeId === null ? null : { id: activeId },
+            ...(latest === undefined ? {} : { latestDeployment: { status: latest } }),
+          },
+        });
+      }, { timeout: 6_000, interval: 250 });
+    };
     const expectBody = async (host: string, body: string) => {
       expect(await hit(host)).toEqual({ status: 200, body });
     };
@@ -190,11 +204,13 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       await assertCaddyPrivate();
       const p = await project('Phase 3 smoke app');
       const other = await project('Phase 3 second app');
+      await expectHosting(p, 'UNAVAILABLE', null);
       expect((await hit('app-aaaaaaaaaaaa4aaa8aaaaaaaaaaaaaaa.localhost')).status).toBe(404);
       const initial = await deploy(p.id);
       expect(initial.status, JSON.stringify(initial.body)).toBe(201);
       const first = await deployment(await active(p.id));
       await expectBody(p.host, 'v1');
+      await expectHosting(p, 'AVAILABLE', first.id, 'RUNNING');
       expect((await hit('unknown.localhost')).status).toBe(404);
 
       revision = 'other';
@@ -207,6 +223,7 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       expect(second.id).not.toBe(first.id);
       expect((await deployment(first.id)).status).toBe('STOPPED');
       await expectBody(p.host, 'v2');
+      await expectHosting(p, 'AVAILABLE', second.id, 'RUNNING');
       expect(await active(other.id)).toBe(otherActive);
       await expectBody(other.host, 'other');
       console.info('Live initial deploy and redeploy: exact stable hostname and two isolated projects.');
@@ -217,6 +234,7 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
         expect(failed.status, JSON.stringify(failed.body)).toBe(422);
         expect(await active(p.id)).toBe(second.id);
         await expectBody(p.host, 'v2');
+        await expectHosting(p, 'AVAILABLE', second.id, 'FAILED');
       }
       console.info('Real Docker build and health failures preserved the active v2 route.');
 
@@ -249,12 +267,15 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       const rolledBack = await deployment(await active(p.id));
       expect(rolledBack.rollbackSourceDeploymentId).toBe(first.id);
       await expectBody(p.host, 'v1');
+      await expectHosting(p, 'AVAILABLE', rolledBack.id, 'RUNNING');
       expect((await action(rolledBack.id, 'stop')).status).toBe(200);
       expect(await active(p.id)).toBeNull();
       expect((await hit(p.host)).status).toBe(404);
+      await expectHosting(p, 'UNAVAILABLE', null, 'STOPPED');
       expect((await action(rolledBack.id, 'restart')).status).toBe(200);
       expect(await active(p.id)).toBe(rolledBack.id);
       await expectBody(p.host, 'v1');
+      await expectHosting(p, 'AVAILABLE', rolledBack.id, 'RUNNING');
       console.info('Real rollback, stop, and explicit restart reused the same hostname.');
 
       const beforeFence = await admin({ method: 'GET' });
@@ -291,6 +312,7 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       }, { timeout: 15_000 });
       const hookDeployment = await deployment(await active(p.id));
       expect(hookDeployment.id).not.toBe(rolledBack.id);
+      await expectHosting(p, 'AVAILABLE', hookDeployment.id, 'RUNNING');
       await vi.waitFor(async () => {
         expect((await database.project.findUniqueOrThrow({ where: { id: p.id } })).routingOperation).toBeNull();
       }, { timeout: 8000 });
@@ -322,6 +344,7 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       await stop(backend);
       backend = undefined;
       await stopCaddy();
+      await expectHosting(p, 'RECOVERING', hookDeployment.id, 'RUNNING');
       await startCaddy();
       expect((await hit(p.host)).status).toBe(404);
       await database.deployment.update({ where: { id: hookDeployment.id }, data: { hostPort: 1 } });
@@ -345,6 +368,7 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       }, { timeout: 20_000 });
       await stop(backend);
       backend = undefined;
+      await expectHosting(p, 'AVAILABLE', hookDeployment.id, 'RUNNING');
       console.info('Fresh backend process repaired an interrupted promotion; fresh Caddy bootstraps recovered both active routes.');
       await assertCaddyPrivate();
 

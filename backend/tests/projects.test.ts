@@ -69,6 +69,18 @@ const project = {
   createdAt: now,
   updatedAt: now,
 };
+const hostingFields = {
+  localApplicationUrl: null,
+  hostingStatus: 'DISABLED',
+  activeDeployment: null,
+  latestDeployment: null,
+};
+const projectWithHostingRelations = {
+  ...project,
+  activeDeployment: null,
+  deployments: [],
+  routingOperation: null,
+};
 
 let authorization: string;
 
@@ -113,7 +125,7 @@ describe('POST /api/projects', () => {
     expect(response.body).toEqual({
       project: {
         ...project,
-        localApplicationUrl: null,
+        ...hostingFields,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
       },
@@ -230,7 +242,7 @@ describe('POST /api/projects', () => {
 
 describe('GET /api/projects', () => {
   it('lists only projects belonging to the authenticated user', async () => {
-    databaseMocks.findMany.mockResolvedValue([project]);
+    databaseMocks.findMany.mockResolvedValue([projectWithHostingRelations]);
 
     const response = await request(createApp())
       .get('/api/projects')
@@ -241,7 +253,7 @@ describe('GET /api/projects', () => {
       projects: [
         {
           ...project,
-          localApplicationUrl: null,
+          ...hostingFields,
           createdAt: now.toISOString(),
           updatedAt: now.toISOString(),
         },
@@ -256,17 +268,43 @@ describe('GET /api/projects', () => {
 
 describe('GET /api/projects/:id', () => {
   it('returns an owned project', async () => {
-    databaseMocks.findFirst.mockResolvedValue(project);
+    databaseMocks.findFirst.mockResolvedValue(projectWithHostingRelations);
 
     const response = await request(createApp())
       .get(`/api/projects/${projectId}`)
       .set('Authorization', authorization);
 
     expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ project: hostingFields });
     const getArgs = databaseMocks.findFirst.mock.calls[0]?.[0] as {
       where: Record<string, unknown>;
     };
     expect(getArgs.where).toEqual({ id: projectId, userId });
+  });
+
+  it('returns separate active and latest summaries without internal routing fields', async () => {
+    const active = { id: 'active', status: 'RUNNING', commitHash: 'first', createdAt: now };
+    const latest = { id: 'latest', status: 'FAILED', commitHash: 'second', createdAt: now };
+    databaseMocks.findFirst.mockResolvedValue({
+      ...projectWithHostingRelations,
+      activeDeployment: { ...active, hostPort: 35000 },
+      deployments: [latest],
+    });
+
+    const response = await request(createApp()).get(`/api/projects/${projectId}`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      project: {
+        ...project,
+        ...hostingFields,
+        activeDeployment: { ...active, createdAt: now.toISOString() },
+        latestDeployment: { ...latest, createdAt: now.toISOString() },
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      },
+    });
   });
 
   it("does not expose another user's project", async () => {
@@ -289,7 +327,7 @@ describe('GET /api/projects/:id', () => {
 
 describe('PATCH /api/projects/:id', () => {
   it('updates the health-check path for an owned project', async () => {
-    const updatedProject = { ...project, healthCheckPath: '/health' };
+    const updatedProject = { ...projectWithHostingRelations, healthCheckPath: '/health' };
     databaseMocks.updateMany.mockResolvedValue({ count: 1 });
     databaseMocks.findFirst.mockResolvedValue(updatedProject);
 

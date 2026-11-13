@@ -11,6 +11,9 @@ export type Project = {
   id: string;
   hostnameLabel: string;
   localApplicationUrl: string | null;
+  hostingStatus: HostingStatus;
+  activeDeployment: DeploymentSummary | null;
+  latestDeployment: DeploymentSummary | null;
   userId: string;
   name: string;
   repositoryUrl: string;
@@ -39,6 +42,13 @@ export type DeploymentStatus =
   | "FAILED"
   | "STOPPED";
 
+export type HostingStatus =
+  | "DISABLED"
+  | "AVAILABLE"
+  | "DEPLOYING"
+  | "UNAVAILABLE"
+  | "RECOVERING";
+
 export type ApplicationType = "DOCKERFILE" | "NODE" | "PYTHON";
 
 export type Deployment = {
@@ -58,6 +68,9 @@ export type Deployment = {
   createdAt: string;
   updatedAt: string;
 };
+
+export type DeploymentSummary = Pick<Deployment, "id" | "status" | "commitHash" | "createdAt">;
+export const PROJECT_REFRESH_INTERVAL_MS = 5_000;
 
 export type DeploymentMetrics = {
   status: DeploymentStatus;

@@ -2,14 +2,16 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { DeploymentLogsPanel } from "@/components/deployment-logs-panel";
 import { DeploymentMetricsPanel } from "@/components/deployment-metrics-panel";
 import { GitHubWebhookPanel } from "@/components/github-webhook-panel";
+import { ProjectHosting } from "@/components/project-hosting";
 import { useAuth } from "@/context/auth-context";
 import {
   ApiError,
+  PROJECT_REFRESH_INTERVAL_MS,
   deploymentApi,
   projectApi,
   type Deployment,
@@ -38,7 +40,7 @@ const ACTION_PENDING_LABELS: Record<DeploymentAction, string> = {
   redeploy: "Redeploying…",
 };
 
-const NEW_DEPLOYMENT_POLL_INTERVAL_MS = 150;
+const NEW_DEPLOYMENT_POLL_INTERVAL_MS = 750;
 
 const isValidHealthCheckPath = (value: string): boolean =>
   value.length > 0 &&
@@ -98,30 +100,34 @@ export default function ProjectDetailsPage() {
   const [selectedDeploymentId, setSelectedDeploymentId] = useState<string | null>(
     null,
   );
+  const requestId = useRef(0);
 
   const loadProject = useCallback(
-    async (signal?: AbortSignal, showLoading = true) => {
+    async (signal?: AbortSignal, showLoading = true, selectedId?: string) => {
       if (token === null) return;
 
+      const id = ++requestId.current;
       if (showLoading) setIsLoading(true);
-      setLoadError(null);
 
       try {
         const [projectResult, deploymentResult] = await Promise.all([
           projectApi.get(token, projectId, signal),
           projectApi.listDeployments(token, projectId, signal),
         ]);
+        if (signal?.aborted || id !== requestId.current) return;
         setProject(projectResult);
-        setHealthCheckPath(projectResult.healthCheckPath);
+        if (showLoading) setHealthCheckPath(projectResult.healthCheckPath);
         setDeployments(deploymentResult);
+        setLoadError(null);
         setSelectedDeploymentId((current) =>
-          current !== null &&
-          deploymentResult.some((deployment) => deployment.id === current)
-            ? current
-            : (deploymentResult[0]?.id ?? null),
+          selectedId ?? (
+            current !== null && deploymentResult.some((deployment) => deployment.id === current)
+              ? current
+              : (projectResult.activeDeployment?.id ?? deploymentResult[0]?.id ?? null)
+          ),
         );
       } catch (requestError: unknown) {
-        if (signal?.aborted === true) return;
+        if (signal?.aborted || id !== requestId.current) return;
 
         if (requestError instanceof ApiError && requestError.status === 401) {
           logout();
@@ -136,7 +142,7 @@ export default function ProjectDetailsPage() {
               : "Unable to load this project.",
         );
       } finally {
-        if (showLoading && signal?.aborted !== true) setIsLoading(false);
+        if (!signal?.aborted && id === requestId.current) setIsLoading(false);
       }
     },
     [logout, projectId, token],
@@ -157,7 +163,7 @@ export default function ProjectDetailsPage() {
             (deployment) => !knownDeploymentIds.has(deployment.id),
           );
 
-          if (newDeployment !== undefined) {
+          if (newDeployment !== undefined && !signal.aborted) {
             setDeployments(deploymentResult);
             setSelectedDeploymentId(newDeployment.id);
             return;
@@ -180,35 +186,43 @@ export default function ProjectDetailsPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    queueMicrotask(() => {
-      if (!controller.signal.aborted) void loadProject(controller.signal);
-    });
-    return () => controller.abort();
+    let timer: number;
+    const refresh = async (initial = false) => {
+      if (controller.signal.aborted) return;
+      if (initial || !document.hidden) await loadProject(controller.signal, initial);
+      if (!controller.signal.aborted) {
+        timer = window.setTimeout(() => void refresh(), PROJECT_REFRESH_INTERVAL_MS);
+      }
+    };
+    queueMicrotask(() => void refresh(true));
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
   }, [loadProject]);
 
   const latestDeployment = deployments[0] ?? null;
+  const activeDeployment = project?.activeDeployment ?? null;
+  const runningDeployment = project?.hostingStatus === "DISABLED"
+    ? deployments.find((deployment) => deployment.status === "RUNNING" && deployment.containerId !== null)
+    : deployments.find((deployment) => deployment.id === activeDeployment?.id);
+  const lastStoppedDeployment = deployments
+    .filter((deployment) => deployment.status === "STOPPED" && deployment.containerId !== null)
+    .sort((a, b) => (b.finishedAt ?? b.updatedAt).localeCompare(a.finishedAt ?? a.updatedAt))[0];
+  const restartTarget = runningDeployment ?? (activeDeployment === null ? lastStoppedDeployment : undefined);
   const selectedDeployment =
     deployments.find((deployment) => deployment.id === selectedDeploymentId) ?? null;
   const deploymentBusy =
     latestDeployment !== null && isDeploymentInProgress(latestDeployment.status);
   const actionsBusy =
     pendingAction !== null || pendingRollbackId !== null || deploymentBusy;
-  const hasUsableContainer =
-    latestDeployment?.containerId != null &&
-    (latestDeployment.status === "RUNNING" || latestDeployment.status === "STOPPED");
-
-  const actionAvailability = useMemo(
-    () => ({
-      deploy: latestDeployment === null && !actionsBusy,
-      stop:
-        latestDeployment?.status === "RUNNING" &&
-        latestDeployment.containerId !== null &&
-        !actionsBusy,
-      restart: hasUsableContainer && !actionsBusy,
-      redeploy: latestDeployment !== null && !actionsBusy,
-    }),
-    [actionsBusy, hasUsableContainer, latestDeployment],
-  );
+  const actionAvailability = {
+    deploy: latestDeployment === null && !actionsBusy,
+    stop: runningDeployment?.status === "RUNNING" && runningDeployment.containerId !== null && !actionsBusy,
+    restart: restartTarget?.containerId != null &&
+      (restartTarget.status === "RUNNING" || restartTarget.status === "STOPPED") && !actionsBusy,
+    redeploy: latestDeployment !== null && !actionsBusy,
+  };
 
   const runAction = async (action: DeploymentAction) => {
     if (token === null || !actionAvailability[action]) return;
@@ -230,26 +244,19 @@ export default function ProjectDetailsPage() {
 
       if (action === "deploy") {
         actionDeployment = await deploymentApi.deploy(token, projectId);
-      } else if (latestDeployment !== null) {
-        if (action === "stop") {
-          actionDeployment = await deploymentApi.stop(token, latestDeployment.id);
-        } else if (action === "restart") {
-          actionDeployment = await deploymentApi.restart(
-            token,
-            latestDeployment.id,
-          );
-        } else {
-          actionDeployment = await deploymentApi.redeploy(
-            token,
-            latestDeployment.id,
-          );
-        }
+      } else if (action === "stop" && runningDeployment !== undefined) {
+        actionDeployment = await deploymentApi.stop(token, runningDeployment.id);
+      } else if (action === "restart" && restartTarget !== undefined) {
+        actionDeployment = await deploymentApi.restart(token, restartTarget.id);
+      } else if (action === "redeploy" && latestDeployment !== null) {
+        actionDeployment = await deploymentApi.redeploy(token, latestDeployment.id);
       }
 
-      await loadProject(undefined, false);
+      trackingController.abort();
       if (actionDeployment !== null) {
         setSelectedDeploymentId(actionDeployment.id);
       }
+      await loadProject(undefined, false, actionDeployment?.id);
     } catch (requestError: unknown) {
       if (requestError instanceof ApiError && requestError.status === 401) {
         logout();
@@ -261,6 +268,7 @@ export default function ProjectDetailsPage() {
           ? requestError.message
           : `${ACTION_LABELS[action]} could not be completed.`,
       );
+      trackingController.abort();
       await loadProject(undefined, false);
     } finally {
       trackingController.abort();
@@ -293,8 +301,9 @@ export default function ProjectDetailsPage() {
         token,
         sourceDeployment.id,
       );
-      await loadProject(undefined, false);
+      trackingController.abort();
       setSelectedDeploymentId(rollbackDeployment.id);
+      await loadProject(undefined, false, rollbackDeployment.id);
       setActionSuccess(
         `Rollback completed. Deployment ${rollbackDeployment.id} is running.`,
       );
@@ -309,6 +318,7 @@ export default function ProjectDetailsPage() {
           ? requestError.message
           : "Rollback could not be completed.",
       );
+      trackingController.abort();
       await loadProject(undefined, false);
     } finally {
       trackingController.abort();
@@ -334,6 +344,7 @@ export default function ProjectDetailsPage() {
         project.id,
         normalizedPath,
       );
+      requestId.current += 1;
       setProject(updatedProject);
       setHealthCheckPath(updatedProject.healthCheckPath);
       setActionSuccess("Health-check path updated.");
@@ -459,8 +470,42 @@ export default function ProjectDetailsPage() {
             <div className="mt-8 grid gap-5 lg:grid-cols-3">
               <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">
                 <h2 className="text-lg font-semibold tracking-tight text-slate-950">
-                  Latest deployment
+                  Application hosting
                 </h2>
+                <div className="mt-4 flex flex-wrap items-start justify-between gap-5 border-b border-slate-100 pb-5">
+                  <ProjectHosting
+                    project={project}
+                    isChangingRoute={pendingAction === "stop" || pendingAction === "restart"}
+                  />
+                  <div>
+                    <p className="text-xs font-medium tracking-wide text-slate-500 uppercase">
+                      Active deployment
+                    </p>
+                    {activeDeployment === null ? (
+                      <p className="mt-2 text-sm text-slate-600">No active hosted deployment</p>
+                    ) : (
+                      <>
+                        <p className="mt-2 break-all font-mono text-xs text-slate-800">{activeDeployment.id}</p>
+                        {activeDeployment.commitHash !== null ? (
+                          <p className="mt-1 break-all font-mono text-xs text-slate-600">{activeDeployment.commitHash}</p>
+                        ) : null}
+                      </>
+                    )}
+                  </div>
+                  {project.hostingStatus === "DISABLED" && runningDeployment?.hostPort != null ? (
+                    <a
+                      className="button-secondary"
+                      href={`http://localhost:${runningDeployment.hostPort}`}
+                      rel="noreferrer"
+                      target="_blank"
+                    >
+                      Open local Docker port
+                    </a>
+                  ) : null}
+                </div>
+                <h3 className="mt-5 text-base font-semibold tracking-tight text-slate-950">
+                  Latest deployment attempt
+                </h3>
 
                 {latestDeployment === null ? (
                   <div className="mt-6 rounded-xl border border-dashed border-slate-300 px-5 py-10 text-center">
@@ -473,22 +518,7 @@ export default function ProjectDetailsPage() {
                   <div className="mt-6">
                     <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-100 pb-5">
                       <StatusBadge status={latestDeployment.status} />
-                      {latestDeployment.status === "RUNNING" &&
-                      latestDeployment.hostPort !== null ? (
-                        <div className="text-right">
-                          <a
-                            className="button-primary"
-                            href={`http://localhost:${latestDeployment.hostPort}`}
-                            rel="noreferrer"
-                            target="_blank"
-                          >
-                            Open Application
-                          </a>
-                          <p className="mt-2 text-xs text-slate-500">
-                            Local deployment access
-                          </p>
-                        </div>
-                      ) : null}
+                      <p className="break-all font-mono text-xs text-slate-600">{latestDeployment.id}</p>
                     </div>
 
                     <dl className="mt-5 grid gap-x-8 gap-y-5 sm:grid-cols-2">
@@ -698,9 +728,9 @@ export default function ProjectDetailsPage() {
                           <td className="px-4 py-4">
                             <div className="flex flex-col items-start gap-2">
                               <StatusBadge status={deployment.status} />
-                              {deployment.status === "RUNNING" ? (
+                              {deployment.id === activeDeployment?.id ? (
                                 <span className="text-xs font-semibold text-emerald-700">
-                                  Currently running
+                                  Active deployment
                                 </span>
                               ) : null}
                             </div>

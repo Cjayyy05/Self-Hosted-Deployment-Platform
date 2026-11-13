@@ -14,6 +14,7 @@ import { containerService, type RoutingContainer } from './container.service.js'
 
 const READ_BACK_WINDOW_MS = 3_000;
 const READ_BACK_DELAY_MS = 100;
+const DASHBOARD_ROUTE_TTL_MS = 3_000;
 
 const unknownHostRoute = {
   handle: [{ handler: 'static_response', status_code: 404, body: 'Unknown host' }],
@@ -47,6 +48,8 @@ const firstRecord = (value: unknown): Record<string, unknown> | undefined =>
   Array.isArray(value) && isRecord(value[0]) ? value[0] : undefined;
 
 const routeHostname = (route: ApplicationRoute): string => route.match[0].host[0];
+const upstreamPort = (route: ApplicationRoute): number =>
+  Number(route.handle[0]?.upstreams[0]?.dial.slice('127.0.0.1:'.length));
 
 const parseRoutes = (body: string, suffix: string): Routes => {
   const data: unknown = JSON.parse(body);
@@ -91,6 +94,7 @@ const parseRoutes = (body: string, suffix: string): Routes => {
 export class ApplicationRoutingService {
   #queue: Promise<void> = Promise.resolve();
   #uncertain = false;
+  #dashboardRoutes: { expiresAt: number; ports: Promise<ReadonlyMap<string, number>> } | undefined;
   readonly #hostnameSuffix: string;
 
   constructor(
@@ -121,7 +125,25 @@ export class ApplicationRoutingService {
     const hostname = this.#hostname(projectId);
     const { routes } = await this.#readRoutes();
     const route = (routes.slice(0, -1) as ApplicationRoute[]).find((entry) => routeHostname(entry) === hostname);
-    return route === undefined ? null : Number(route.handle[0]?.upstreams[0]?.dial.slice('127.0.0.1:'.length));
+    return route === undefined ? null : upstreamPort(route);
+  }
+
+  public async readDashboardPorts(): Promise<ReadonlyMap<string, number>> {
+    if (this.#uncertain) {
+      throw new ApplicationRoutingError('uncertain', 'Caddy routing requires reconciliation');
+    }
+    if (this.#dashboardRoutes === undefined || this.#dashboardRoutes.expiresAt <= performance.now()) {
+      const ports = this.#readRoutes().then(({ routes }) => new Map(
+        (routes.slice(0, -1) as ApplicationRoute[]).map((route) => [routeHostname(route), upstreamPort(route)]),
+      ));
+      this.#dashboardRoutes = { expiresAt: performance.now() + DASHBOARD_ROUTE_TTL_MS, ports };
+    }
+    const snapshot = this.#dashboardRoutes;
+    const ports = await snapshot.ports;
+    if (this.#dashboardRoutes !== snapshot) {
+      throw new ApplicationRoutingError('uncertain', 'Caddy routing changed during the status check');
+    }
+    return ports;
   }
 
   #hostname(projectId: string): string {
@@ -160,8 +182,13 @@ export class ApplicationRoutingService {
         ...unknownHostRoute,
         '@id': 'deployflow-revision-' + randomUUID().replaceAll('-', ''),
       }];
-      await this.#replaceRoutes(current, expected);
-      if (repair) this.#uncertain = false;
+      this.#dashboardRoutes = undefined;
+      try {
+        await this.#replaceRoutes(current, expected);
+        if (repair) this.#uncertain = false;
+      } finally {
+        this.#dashboardRoutes = undefined;
+      }
     });
     this.#queue = operation.then(() => undefined, () => undefined);
     return operation;
