@@ -1,0 +1,31 @@
+[Unit]
+Description=DeployFlow API
+Requires=docker.service deployflow-caddy.service postgresql@16-main.service
+After=docker.service deployflow-caddy.service postgresql@16-main.service
+PartOf=docker.service deployflow-caddy.service postgresql@16-main.service
+RequiresMountsFor=/srv/deployflow
+ConditionPathIsMountPoint=/srv/deployflow
+
+[Service]
+Type=exec
+User=deployflow
+Group=deployflow
+SupplementaryGroups=docker deployflow-caddy
+EnvironmentFile=/etc/deployflow/backend.env
+Environment=PATH=/opt/deployflow/node/bin:/usr/bin:/bin
+WorkingDirectory=/opt/deployflow/current/backend
+ExecStartPre=/usr/bin/pg_isready -h 127.0.0.1 -p 5432
+ExecStartPre=/usr/bin/docker info --format "{{.ServerVersion}}"
+ExecStartPre=/usr/bin/curl --fail --silent --output /dev/null --max-time 2 --unix-socket /run/deployflow-caddy/admin.sock http://localhost/config/apps/http/servers/deployflow/routes
+ExecStart=/opt/deployflow/node/bin/node dist/server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=35s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

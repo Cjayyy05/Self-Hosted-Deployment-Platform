@@ -1,4 +1,5 @@
 import { request } from 'node:http';
+import { request as requestHttps } from 'node:https';
 
 import { AppError } from '../utils/app-error.js';
 import { parseHealthCheckPath } from '../utils/health-check-path.js';
@@ -11,6 +12,7 @@ export type ApplicationHealthCheckInput = {
   hostPort: number;
   path: string;
   hostname?: string;
+  https?: true;
 };
 
 export type LocalHealthRequest = (input: {
@@ -18,6 +20,7 @@ export type LocalHealthRequest = (input: {
   path: string;
   timeoutMs: number;
   hostname?: string;
+  https?: true;
 }) => Promise<number>;
 
 type ApplicationHealthCheckDependencies = {
@@ -33,14 +36,16 @@ const requestLocalHealth: LocalHealthRequest = ({
   path,
   timeoutMs,
   hostname,
+  https,
 }) =>
   new Promise((resolve, reject) => {
-    const healthRequest = request(
+    const healthRequest = (https ? requestHttps : request)(
       {
         hostname: '127.0.0.1',
         port: hostPort,
         path,
         method: 'GET',
+        ...(https ? { servername: hostname, rejectUnauthorized: true } : {}),
         headers: {
           Accept: '*/*',
           'User-Agent': 'DeployFlow-HealthCheck/1.0',
@@ -53,9 +58,10 @@ const requestLocalHealth: LocalHealthRequest = ({
       },
     );
 
-    healthRequest.setTimeout(timeoutMs, () => {
+    const timeout = setTimeout(() => {
       healthRequest.destroy(new Error('Health-check request timed out'));
-    });
+    }, timeoutMs);
+    healthRequest.once('close', () => { clearTimeout(timeout); });
     healthRequest.on('error', reject);
     healthRequest.end();
   });
@@ -92,6 +98,9 @@ export class ApplicationHealthCheckService {
   ): Promise<void> {
     const hostPort = parseHostPort(input.hostPort);
     const path = parseHealthCheckPath(input.path);
+    if (input.https && (input.hostname === undefined || hostPort !== 443)) {
+      throw new AppError(400, 'An HTTPS health check requires a project hostname and port 443');
+    }
     if (
       input.hostname !== undefined &&
       (input.hostname.length > 253 ||
@@ -107,6 +116,7 @@ export class ApplicationHealthCheckService {
           path,
           timeoutMs: this.#requestTimeoutMs,
           ...(input.hostname === undefined ? {} : { hostname: input.hostname }),
+          ...(input.https ? { https: true } : {}),
         });
         if (statusCode >= 200 && statusCode < 400) return;
       } catch {

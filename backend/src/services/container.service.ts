@@ -1,5 +1,6 @@
 import Dockerode from 'dockerode';
 
+import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
 
 const UUID_PATTERN =
@@ -11,6 +12,14 @@ const DEFAULT_LOG_TAIL = 1_000;
 const MAX_LOG_TAIL = 10_000;
 const MAX_LOG_RESPONSE_BYTES = 1024 * 1024;
 const TRUNCATED_LOG_PREFIX = '[Earlier log output truncated]\n';
+const LINUX_WORKLOAD_LIMITS = {
+  Memory: 512 * 1024 * 1024,
+  MemorySwap: 512 * 1024 * 1024,
+  NanoCpus: 1_000_000_000,
+  PidsLimit: 128,
+  SecurityOpt: ['no-new-privileges:true'],
+  RestartPolicy: { Name: 'unless-stopped' },
+} as const;
 
 export type StartContainerInput = {
   imageIdentifier: string;
@@ -67,6 +76,12 @@ export type ContainerCreateOptions = {
       Type: 'json-file';
       Config: { 'max-size': string; 'max-file': string };
     };
+    Memory?: number;
+    MemorySwap?: number;
+    NanoCpus?: number;
+    PidsLimit?: number;
+    SecurityOpt?: readonly string[];
+    RestartPolicy?: { Name: 'unless-stopped' };
   };
   Labels: Record<string, string>;
 };
@@ -82,6 +97,19 @@ type ContainerInspectResult = {
   };
   NetworkSettings?: {
     Ports?: Record<string, unknown>;
+  };
+  HostConfig?: {
+    Memory?: number;
+    MemorySwap?: number;
+    NanoCpus?: number;
+    PidsLimit?: number;
+    SecurityOpt?: string[] | null;
+    RestartPolicy?: { Name?: string };
+    NetworkMode?: string;
+    Privileged?: boolean;
+    Binds?: unknown[] | null;
+    Mounts?: unknown[] | null;
+    VolumesFrom?: unknown[] | null;
   };
 };
 
@@ -110,6 +138,18 @@ export type DockerClient = {
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
+
+const assertLinuxWorkloadLimits = (details: ContainerInspectResult): void => {
+  const config = details.HostConfig;
+  if (config?.Memory !== LINUX_WORKLOAD_LIMITS.Memory ||
+    config.MemorySwap !== LINUX_WORKLOAD_LIMITS.MemorySwap || config.NanoCpus !== LINUX_WORKLOAD_LIMITS.NanoCpus ||
+    config.PidsLimit !== LINUX_WORKLOAD_LIMITS.PidsLimit || config.RestartPolicy?.Name !== 'unless-stopped' ||
+    !config.SecurityOpt?.includes('no-new-privileges:true') || config.Privileged !== false ||
+    (config.NetworkMode !== 'bridge' && config.NetworkMode !== 'default') ||
+    config.Binds?.length || config.Mounts?.length || config.VolumesFrom?.length) {
+    throw new AppError(422, 'Docker did not verify the Linux workload limits; create a new deployment');
+  }
+};
 
 const getRecord = (
   value: Record<string, unknown>,
@@ -290,6 +330,7 @@ export class ContainerService {
   public constructor(
     docker: DockerClient = new Dockerode() as unknown as DockerClient,
     now: () => number = Date.now,
+    private readonly linuxHosting = env.hosting.publicApp !== undefined,
   ) {
     this.#docker = docker;
     this.#now = now;
@@ -315,6 +356,7 @@ export class ContainerService {
             Type: 'json-file',
             Config: { 'max-size': '10m', 'max-file': '3' },
           },
+          ...(this.linuxHosting ? LINUX_WORKLOAD_LIMITS : {}),
         },
         Labels: { 'deployflow.deployment-id': input.deploymentId },
       });
@@ -352,6 +394,7 @@ export class ContainerService {
     const containerPort = parseContainerPort(rawContainerPort);
 
     try {
+      if (this.linuxHosting) assertLinuxWorkloadLimits(await container.inspect());
       await container.restart();
       const details = await container.inspect();
       return {
@@ -403,6 +446,7 @@ export class ContainerService {
       if (!local) throw new AppError(422, 'Routing requires a local Docker socket or named pipe');
 
       const details = await this.#docker.getContainer(containerId).inspect();
+      if (this.linuxHosting) assertLinuxWorkloadLimits(details);
       if (
         details.Id !== containerId ||
         details.Config?.Labels?.['deployflow.deployment-id'] !== input.deploymentId.toLowerCase() ||

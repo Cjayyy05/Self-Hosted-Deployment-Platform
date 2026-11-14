@@ -28,6 +28,28 @@ describe('GitRepositoryService', () => {
     runGit = vi.fn<GitCommandRunner>();
   });
 
+  it('rejects an unapproved source before Git and removes a clone of an unreviewed branch tip', async () => {
+    const approved = {
+      projectId: '11111111-1111-4111-8111-111111111111',
+      repositoryUrl,
+      branch: 'main',
+      commits: new Set([commitHash]),
+    };
+    const service = new GitRepositoryService({ runGit }, approved);
+    await expect(service.prepareRepository({ repositoryUrl, branch: 'other' })).rejects.toMatchObject({ statusCode: 403 });
+    await expect(service.prepareRepositoryAtCommit({ repositoryUrl, branch: 'main', commitHash: 'f'.repeat(40) }))
+      .rejects.toMatchObject({ statusCode: 403 });
+    expect(runGit).not.toHaveBeenCalled();
+    let clone: string | undefined;
+    runGit.mockImplementation((args) => {
+      if (args[0] === 'clone') clone = args.at(-1);
+      return Promise.resolve('f'.repeat(40));
+    });
+    await expect(service.prepareRepository({ repositoryUrl, branch: 'main' })).rejects.toMatchObject({ statusCode: 403 });
+    expect(clone).toBeDefined();
+    expect(await pathExists(clone ?? '')).toBe(false);
+  });
+
   it('rejects an invalid URL before creating or cloning', async () => {
     const service = new GitRepositoryService({ runGit });
 

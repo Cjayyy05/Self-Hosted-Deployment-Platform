@@ -1,11 +1,11 @@
 import { env, type HostingConfig } from '../config/env.js';
 import type { DeploymentStatus, RoutingOperation } from '../generated/prisma/client.js';
-import { localProjectUrl } from '../utils/project-hostname.js';
+import { localProjectUrl, projectHostnameLabel, projectRouteProbe, publicProbePath } from '../utils/project-hostname.js';
 import { ApplicationHealthCheckService } from './application-health-check.service.js';
 import type { ApplicationRoutingService } from './application-routing.service.js';
 import { applicationRoutingService } from './deployment-routing.service.js';
 
-type HostingStatus = 'DISABLED' | 'AVAILABLE' | 'DEPLOYING' | 'UNAVAILABLE' | 'RECOVERING';
+type HostingStatus = 'DISABLED' | 'AVAILABLE' | 'VERIFYING_HTTPS' | 'DEPLOYING' | 'UNAVAILABLE' | 'RECOVERING';
 
 type HostingProject = {
   hostnameLabel: string;
@@ -32,11 +32,27 @@ export class ProjectHostingService {
 
   public async summarize(project: HostingProject): Promise<{
     localApplicationUrl: string | null;
+    publicApplicationUrl?: string;
+    publicProbePath?: string;
     hostingStatus: HostingStatus;
   }> {
     if (this.routes === undefined) return { localApplicationUrl: null, hostingStatus: 'DISABLED' };
+    const publicApp = this.hosting.publicApp;
+    if (publicApp !== undefined && project.hostnameLabel !== projectHostnameLabel(publicApp.projectId)) {
+      return { localApplicationUrl: null, hostingStatus: 'DISABLED' };
+    }
     const url = new URL(localProjectUrl(project.hostnameLabel, this.hosting));
     const hostingStatus = await this.#status(this.routes, project, url);
+    if (publicApp !== undefined) {
+      const port = project.activeDeployment?.hostPort;
+      return {
+        localApplicationUrl: null,
+        publicApplicationUrl: url.origin,
+        hostingStatus: hostingStatus === 'AVAILABLE' ? 'VERIFYING_HTTPS' : hostingStatus,
+        ...(hostingStatus === 'AVAILABLE' && port != null
+          ? { publicProbePath: publicProbePath(url.hostname, port, project.healthCheckPath) } : {}),
+      };
+    }
     return { localApplicationUrl: url.origin, hostingStatus };
   }
 
@@ -79,11 +95,7 @@ export class ProjectHostingService {
     const key = url.hostname + path;
     const cached = probes.get(key);
     if (cached !== undefined) return cached;
-    const result = this.health.waitUntilHealthy({
-      hostPort: url.port === '' ? 80 : Number(url.port),
-      hostname: url.hostname,
-      path,
-    }).then(() => true, () => false);
+    const result = this.health.waitUntilHealthy(projectRouteProbe(url, path)).then(() => true, () => false);
     if (probes.size < MAX_CACHED_PROBES) probes.set(key, result);
     return result;
   }

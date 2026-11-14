@@ -1,0 +1,15 @@
+[Unit]
+Description=Back up DeployFlow to private object storage
+Wants=network-online.target
+After=network-online.target postgresql@16-main.service
+RequiresMountsFor=/srv/deployflow
+ConditionPathIsMountPoint=/srv/deployflow
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/deployflow/backup.env
+ExecStart=/usr/local/libexec/deployflow-backup
+TimeoutStartSec=15min
+UMask=0077
+PrivateTmp=yes
+ProtectHome=yes

@@ -2,10 +2,11 @@ import { database } from '../config/database.js';
 import { env, type HostingConfig } from '../config/env.js';
 import type { Deployment, Prisma } from '../generated/prisma/client.js';
 import { AppError } from '../utils/app-error.js';
-import { localProjectUrl, projectHostnameLabel } from '../utils/project-hostname.js';
+import { localProjectUrl, projectHostnameLabel, projectRouteProbe } from '../utils/project-hostname.js';
 import { ApplicationHealthCheckService } from './application-health-check.service.js';
 import { ApplicationRoutingError, createApplicationRoutingService, type ApplicationRoutingService } from './application-routing.service.js';
 import { containerService, type RoutingContainer } from './container.service.js';
+import { assertApprovedCommit, assertApprovedSource } from './public-application-policy.js';
 import {
   projectOperationLockService,
   type ProjectOperationLease,
@@ -14,6 +15,8 @@ import {
 
 const routingSelect = {
   id: true,
+  repositoryUrl: true,
+  branch: true,
   containerPort: true,
   healthCheckPath: true,
   activeDeploymentId: true,
@@ -23,7 +26,7 @@ const routingSelect = {
 type RoutingProject = Prisma.ProjectGetPayload<{ select: typeof routingSelect }>;
 type RoutingUpdate = Pick<Prisma.ProjectUncheckedUpdateManyInput,
   'activeDeploymentId' | 'routingOperation' | 'routingDeploymentId'>;
-type Candidate = Pick<Deployment, 'id' | 'projectId' | 'containerId' | 'hostPort'>;
+type Candidate = Pick<Deployment, 'id' | 'projectId' | 'containerId' | 'hostPort'> & { commitHash?: string | null };
 type VerifiedTarget = { deployment: Candidate; binding: RoutingContainer; port: number };
 type RoutingDatabase = Pick<typeof database, 'project' | 'deployment' | '$transaction'>;
 const clearOperation = { routingOperation: null, routingDeploymentId: null };
@@ -213,7 +216,10 @@ export class DeploymentRoutingService {
     this.#reconciling = true;
     try {
       const projects = await this.db.project.findMany({
-        where: { OR: [{ routingOperation: { not: null } }, { activeDeploymentId: { not: null } }] },
+        where: {
+          ...(this.hosting.publicApp === undefined ? {} : { id: this.hosting.publicApp.projectId }),
+          OR: [{ routingOperation: { not: null } }, { activeDeploymentId: { not: null } }],
+        },
         select: { id: true },
       });
       for (const { id } of projects) {
@@ -313,12 +319,21 @@ export class DeploymentRoutingService {
   }
 
   async #healthy(project: RoutingProject, deployment: Deployment): Promise<VerifiedTarget | null> {
+    try {
+      assertApprovedSource(this.hosting.publicApp, project);
+      assertApprovedCommit(this.hosting.publicApp, deployment.commitHash);
+    } catch (error) {
+      if (error instanceof AppError && error.statusCode === 403) return null;
+      throw error;
+    }
     if (!(await this.#inspect(deployment))?.running) return null;
     let target: VerifiedTarget;
     try {
       target = await this.#binding(project, deployment);
     } catch (error) {
-      if (isMissing(error)) return null;
+      if (isMissing(error) || (this.hosting.publicApp !== undefined && error instanceof AppError && error.statusCode === 422)) {
+        return null;
+      }
       throw error;
     }
     try {
@@ -331,14 +346,15 @@ export class DeploymentRoutingService {
   }
 
   async #publish(project: RoutingProject, target: VerifiedTarget, lease: ProjectOperationLease, fence: boolean) {
+    assertApprovedSource(this.hosting.publicApp, project);
+    assertApprovedCommit(this.hosting.publicApp, target.deployment.commitHash ?? null);
     await lease.assertValid();
-    const options = { expectedPort: target.port, beforeWrite: lease.assertValid };
+    const options = { expectedPort: target.port, beforeWrite: lease.assertValid,
+      ...(this.hosting.publicApp === undefined ? {} : { healthPath: project.healthCheckPath }) };
     if (fence) await this.routes.repair(project.id, target.binding, options);
     else await this.routes.upsert(project.id, target.binding, options);
     const url = new URL(localProjectUrl(projectHostnameLabel(project.id), this.hosting));
-    await this.health.waitUntilHealthy({
-      hostPort: url.port === '' ? 80 : Number(url.port), hostname: url.hostname, path: project.healthCheckPath,
-    });
+    await this.health.waitUntilHealthy(projectRouteProbe(url, project.healthCheckPath));
     if (await this.routes.readPort(project.id) !== target.port) throw new RoutingPendingError();
   }
 
@@ -471,6 +487,8 @@ export class DeploymentRoutingService {
     }
     if (!runtime.running && deployment.containerId !== null) {
       await this.#withdraw(project, lease, true);
+      assertApprovedSource(this.hosting.publicApp, project);
+      assertApprovedCommit(this.hosting.publicApp, deployment.commitHash);
       await lease.assertValid();
       await this.containers.restartContainer(deployment.containerId, project.containerPort);
     }

@@ -11,6 +11,8 @@ export type Project = {
   id: string;
   hostnameLabel: string;
   localApplicationUrl: string | null;
+  publicApplicationUrl?: string;
+  publicProbePath?: string;
   hostingStatus: HostingStatus;
   activeDeployment: DeploymentSummary | null;
   latestDeployment: DeploymentSummary | null;
@@ -43,6 +45,7 @@ export type DeploymentStatus =
   | "STOPPED";
 
 export type HostingStatus =
+  | "VERIFYING_HTTPS"
   | "DISABLED"
   | "AVAILABLE"
   | "DEPLOYING"

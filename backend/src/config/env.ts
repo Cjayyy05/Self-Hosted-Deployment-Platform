@@ -3,6 +3,8 @@ import 'dotenv/config';
 import { isIP } from 'node:net';
 import { posix, win32 } from 'node:path';
 
+import { parseGitHubRepositoryUrl } from '../utils/github-repository.js';
+
 const DEFAULT_PORT = 4000;
 const DEFAULT_BIND_HOST = '127.0.0.1';
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
@@ -137,7 +139,33 @@ export type HostingConfig = Readonly<{
   origin: string;
   hostnameSuffix: string;
   adminSocketPath: string | undefined;
+  publicApp?: PublicApplication;
 }>;
+
+export type PublicApplication = Readonly<{
+  projectId: string;
+  repositoryUrl: string;
+  branch: string;
+  commits: ReadonlySet<string>;
+}>;
+
+const parsePublicApplication = (input: {
+  projectId?: string | undefined;
+  repositoryUrl?: string | undefined;
+  branch?: string | undefined;
+  commits?: string | undefined;
+}): PublicApplication | undefined => {
+  const { projectId, repositoryUrl, branch, commits } = input;
+  if ([projectId, repositoryUrl, branch, commits].every((value) => value === undefined)) return undefined;
+  if (!projectId || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(projectId) ||
+    !branch || branch.length > 255 || !/^[A-Za-z0-9_][A-Za-z0-9._/-]*$/.test(branch) || branch.includes('..') ||
+    branch.split('/').some((part) => !part || part.startsWith('.') || part.endsWith('.') || part.endsWith('.lock')) ||
+    !commits || !/^[0-9a-f]{40}(?:,[0-9a-f]{40})*$/.test(commits)) {
+    throw new Error('Public hosting requires an approved project UUID, Git branch, and comma-separated full Git commit hashes');
+  }
+  return Object.freeze({ projectId, repositoryUrl: parseGitHubRepositoryUrl(repositoryUrl).repositoryUrl, branch,
+    commits: new Set(commits.split(',')) });
+};
 
 export const parseCaddyAdminSocketPath = (
   value: string,
@@ -166,14 +194,14 @@ export const parseHostingConfig = (
     origin?: string | undefined;
     hostnameSuffix?: string | undefined;
     adminSocketPath?: string | undefined;
+    publicProjectId?: string | undefined;
+    publicRepositoryUrl?: string | undefined;
+    publicBranch?: string | undefined;
+    publicCommits?: string | undefined;
   },
   platform: NodeJS.Platform = process.platform,
 ): HostingConfig => {
   const origin = input.origin?.trim() ?? 'http://localhost:8080';
-  const match = /^http:\/\/(localhost|127\.0\.0\.1)(?::([1-9]\d{0,4}))?\/?$/.exec(origin);
-  if (match === null || (match[2] !== undefined && Number(match[2]) > 65_535)) {
-    throw new Error('APP_HOSTING_ORIGIN must be a local HTTP origin on localhost or 127.0.0.1');
-  }
   const hostnameSuffix = input.hostnameSuffix?.trim().toLowerCase() ?? 'localhost';
   if (
     hostnameSuffix.length > 216 ||
@@ -183,6 +211,19 @@ export const parseHostingConfig = (
     throw new Error('APP_HOSTNAME_SUFFIX must be a DNS suffix that fits after a project label');
   }
   const socket = input.adminSocketPath?.trim();
+  const publicApp = parsePublicApplication({ projectId: input.publicProjectId,
+    repositoryUrl: input.publicRepositoryUrl, branch: input.publicBranch, commits: input.publicCommits });
+  if (publicApp !== undefined) {
+    if (platform !== 'linux' || !socket || origin !== `https://${hostnameSuffix}` ||
+      !hostnameSuffix.includes('.') || /\.(localhost|local|internal|invalid|test|example)$/.test(hostnameSuffix)) {
+      throw new Error('Public hosting requires Linux, a private Caddy socket, and an HTTPS origin matching APP_HOSTNAME_SUFFIX');
+    }
+    return Object.freeze({ origin, hostnameSuffix, adminSocketPath: parseCaddyAdminSocketPath(socket, platform), publicApp });
+  }
+  const match = /^http:\/\/(localhost|127\.0\.0\.1)(?::([1-9]\d{0,4}))?\/?$/.exec(origin);
+  if (match === null || (match[2] !== undefined && Number(match[2]) > 65_535)) {
+    throw new Error('APP_HOSTING_ORIGIN must be a local HTTP origin on localhost or 127.0.0.1');
+  }
   return Object.freeze({
     origin: new URL(origin).origin,
     hostnameSuffix,
@@ -199,6 +240,10 @@ export const env = Object.freeze({
     origin: process.env.APP_HOSTING_ORIGIN,
     hostnameSuffix: process.env.APP_HOSTNAME_SUFFIX,
     adminSocketPath: process.env.CADDY_ADMIN_SOCKET,
+    publicProjectId: process.env.APP_PUBLIC_PROJECT_ID,
+    publicRepositoryUrl: process.env.APP_PUBLIC_REPOSITORY_URL,
+    publicBranch: process.env.APP_PUBLIC_BRANCH,
+    publicCommits: process.env.APP_PUBLIC_COMMITS,
   }),
   databaseUrl: requireValue('DATABASE_URL', process.env.DATABASE_URL),
   githubWebhookSecretKey: parseWebhookSecretKey(
@@ -221,3 +266,9 @@ export const env = Object.freeze({
     false,
   ),
 });
+
+if (env.hosting.publicApp !== undefined && (env.bindHost !== DEFAULT_BIND_HOST || env.registrationEnabled ||
+  env.githubWebhookSecretKey !== undefined || process.env.DOCKER_HOST !== undefined ||
+  process.env.NODE_TLS_REJECT_UNAUTHORIZED === '0')) {
+  throw new Error('Public hosting requires private API binding, disabled registration and webhooks, local Docker, and TLS verification');
+}

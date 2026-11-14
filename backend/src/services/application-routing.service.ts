@@ -3,7 +3,8 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
 
 import { env, parseHostingConfig, type HostingConfig } from '../config/env.js';
-import { projectHostnameLabel } from '../utils/project-hostname.js';
+import { parseHealthCheckPath } from '../utils/health-check-path.js';
+import { projectHostnameLabel, PUBLIC_PROBE_PREFIX, publicProbePath } from '../utils/project-hostname.js';
 import {
   CADDY_REQUEST_TIMEOUT_MS,
   createCaddyAdminTransport,
@@ -21,17 +22,58 @@ const unknownHostRoute = {
   terminal: true,
 };
 
-const applicationRoute = (hostname: string, port: number) => ({
+const proxy = (port: number) => ({ handler: 'reverse_proxy', upstreams: [{ dial: '127.0.0.1:' + String(port) }] });
+
+const localRoute = (hostname: string, port: number) => ({
   match: [{ host: [hostname] }] as const,
-  handle: [{ handler: 'reverse_proxy', upstreams: [{ dial: '127.0.0.1:' + String(port) }] }],
+  handle: [proxy(port)],
   terminal: true,
 });
 
-type ApplicationRoute = ReturnType<typeof applicationRoute>;
+const probeResponse = (status: number) => ({
+  routes: [{
+    handle: [{
+      handler: 'static_response',
+      status_code: status,
+      headers: {
+        'Access-Control-Allow-Origin': ['http://127.0.0.1:3000'],
+        'Cache-Control': ['no-store'],
+        'X-Content-Type-Options': ['nosniff'],
+      },
+    }],
+  }],
+});
+
+const publicRoute = (hostname: string, port: number, healthPath: string) => ({
+  match: [{ host: [hostname] }] as const,
+  handle: [{
+    handler: 'subroute',
+    routes: [
+      {
+        match: [{ path: [publicProbePath(hostname, port, healthPath)], method: ['GET'] }],
+        handle: [{
+          ...proxy(port),
+          rewrite: { method: 'GET', uri: healthPath + '?' },
+          headers: { request: { delete: ['Authorization', 'Cookie'] } },
+          handle_response: [{ match: { status_code: [2, 3] }, ...probeResponse(204) }, probeResponse(503)],
+        }],
+        terminal: true,
+      },
+      {
+        ...unknownHostRoute,
+        match: [{ path: [PUBLIC_PROBE_PREFIX + '*'] }],
+      },
+      { handle: [proxy(port)], terminal: true },
+    ],
+  }],
+  terminal: true,
+});
+
+type ApplicationRoute = ReturnType<typeof localRoute> | ReturnType<typeof publicRoute>;
 type Fallback = typeof unknownHostRoute & { '@id'?: string };
 type Routes = [...ApplicationRoute[], Fallback];
 type RouteState = { routes: Routes; etag: string };
-type RouteWrite = { beforeWrite?: () => Promise<void>; expectedPort?: number };
+type RouteWrite = { beforeWrite?: () => Promise<void>; expectedPort?: number; healthPath?: string };
 type RoutingErrorCode = 'unavailable' | 'invalid-config' | 'conflict' | 'rejected' | 'uncertain';
 
 export class ApplicationRoutingError extends Error {
@@ -48,10 +90,15 @@ const firstRecord = (value: unknown): Record<string, unknown> | undefined =>
   Array.isArray(value) && isRecord(value[0]) ? value[0] : undefined;
 
 const routeHostname = (route: ApplicationRoute): string => route.match[0].host[0];
-const upstreamPort = (route: ApplicationRoute): number =>
-  Number(route.handle[0]?.upstreams[0]?.dial.slice('127.0.0.1:'.length));
+const upstreamPort = (route: ApplicationRoute): number => {
+  const handler = route.handle[0];
+  if (handler === undefined) return NaN;
+  const upstream = 'routes' in handler ? handler.routes[2]?.handle[0] : handler;
+  if (upstream === undefined || !('upstreams' in upstream)) return NaN;
+  return Number(upstream.upstreams[0]?.dial.slice('127.0.0.1:'.length));
+};
 
-const parseRoutes = (body: string, suffix: string): Routes => {
+const parseRoutes = (body: string, suffix: string, publicHostname?: string): Routes => {
   const data: unknown = JSON.parse(body);
   const fallback: unknown = Array.isArray(data) ? data.at(-1) : undefined;
   if (!Array.isArray(data) || !isRecord(fallback)) {
@@ -71,10 +118,13 @@ const parseRoutes = (body: string, suffix: string): Routes => {
     if (!isRecord(entry)) throw new Error('Caddy returned an invalid managed route');
     const matcher = firstRecord(entry.match);
     const host: unknown = Array.isArray(matcher?.host) ? matcher.host[0] : undefined;
-    const dial = firstRecord(firstRecord(entry.handle)?.upstreams)?.dial;
+    const handler = firstRecord(entry.handle);
+    const subroute = firstRecord(firstRecord(handler?.routes)?.handle);
+    const dial = firstRecord((publicHostname === undefined ? handler : subroute)?.upstreams)?.dial;
     const match = typeof dial === 'string' && /^127\.0\.0\.1:([1-9]\d{0,4})$/.exec(dial);
     if (
       typeof host !== 'string' ||
+      (publicHostname !== undefined && host !== publicHostname) ||
       !host.endsWith('.' + suffix) ||
       !/^app-[a-f0-9]{32}$/.test(host.slice(0, -(suffix.length + 1))) ||
       !match ||
@@ -83,7 +133,13 @@ const parseRoutes = (body: string, suffix: string): Routes => {
     ) {
       throw new Error('Caddy returned an invalid or duplicate managed route');
     }
-    const route = applicationRoute(host, Number(match[1]));
+    const rewrite = subroute?.rewrite;
+    const route = publicHostname === undefined
+      ? localRoute(host, Number(match[1]))
+      : publicRoute(host, Number(match[1]), parseHealthCheckPath(
+        isRecord(rewrite) && typeof rewrite.uri === 'string' && rewrite.uri.endsWith('?')
+          ? rewrite.uri.slice(0, -1) : null,
+      ));
     if (!isDeepStrictEqual(entry, route)) throw new Error('Caddy route is outside the managed layout');
     seen.add(host);
     routes.push(route);
@@ -96,13 +152,16 @@ export class ApplicationRoutingService {
   #uncertain = false;
   #dashboardRoutes: { expiresAt: number; ports: Promise<ReadonlyMap<string, number>> } | undefined;
   readonly #hostnameSuffix: string;
+  readonly #publicHostname: string | undefined;
 
   constructor(
     private readonly transport: CaddyAdminTransport,
     hostnameSuffix: string,
     private readonly docker: Pick<typeof containerService, 'inspectLoopbackRoutingPort'> = containerService,
+    publicProjectId?: string,
   ) {
     this.#hostnameSuffix = parseHostingConfig({ hostnameSuffix }).hostnameSuffix;
+    this.#publicHostname = publicProjectId === undefined ? undefined : this.#hostname(publicProjectId);
   }
 
   public upsert(projectId: string, container: RoutingContainer, options?: RouteWrite): Promise<void> {
@@ -161,6 +220,9 @@ export class ApplicationRoutingService {
         throw new ApplicationRoutingError('uncertain', 'Caddy routing writes are paused until the last update is reconciled');
       }
       const hostname = this.#hostname(projectId);
+      if (this.#publicHostname !== undefined && hostname !== this.#publicHostname) {
+        throw new ApplicationRoutingError('rejected', 'Only the approved project can change the public route');
+      }
       const current = await this.#readRoutes();
       const routes = current.routes.slice(0, -1) as ApplicationRoute[];
       const index = routes.findIndex((route) => routeHostname(route) === hostname);
@@ -172,7 +234,9 @@ export class ApplicationRoutingService {
           (options?.expectedPort !== undefined && port !== options.expectedPort)) {
           throw new ApplicationRoutingError('rejected', 'Docker routing binding changed after verification');
         }
-        const route = applicationRoute(hostname, port);
+        const route = this.#publicHostname === undefined
+          ? localRoute(hostname, port)
+          : publicRoute(hostname, port, parseHealthCheckPath(options?.healthPath));
         if (index === -1) routes.push(route);
         else routes[index] = route;
       }
@@ -205,7 +269,7 @@ export class ApplicationRoutingService {
       throw new ApplicationRoutingError('invalid-config', 'Caddy did not return the managed route list and its ETag');
     }
     try {
-      return { routes: parseRoutes(response.body, this.#hostnameSuffix), etag: response.etag };
+      return { routes: parseRoutes(response.body, this.#hostnameSuffix, this.#publicHostname), etag: response.etag };
     } catch {
       throw new ApplicationRoutingError('invalid-config', 'Caddy route list does not match the DeployFlow bootstrap layout');
     }
@@ -249,4 +313,5 @@ export const createApplicationRoutingService = (
 ): ApplicationRoutingService | undefined =>
   hosting.adminSocketPath === undefined
     ? undefined
-    : new ApplicationRoutingService(createCaddyAdminTransport(hosting.adminSocketPath), hosting.hostnameSuffix);
+    : new ApplicationRoutingService(createCaddyAdminTransport(hosting.adminSocketPath), hosting.hostnameSuffix,
+      containerService, hosting.publicApp?.projectId);

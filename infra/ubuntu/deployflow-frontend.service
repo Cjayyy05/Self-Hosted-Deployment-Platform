@@ -1,0 +1,25 @@
+[Unit]
+Description=DeployFlow dashboard
+After=deployflow-backend.service
+Requires=deployflow-backend.service
+PartOf=deployflow-backend.service
+
+[Service]
+User=deployflow-web
+Group=deployflow-web
+Environment=NODE_ENV=production
+Environment=NEXT_TELEMETRY_DISABLED=1
+Environment=PATH=/opt/deployflow/node/bin:/usr/bin:/bin
+WorkingDirectory=/opt/deployflow/current/frontend
+ExecStartPre=/usr/bin/curl --fail --silent --output /dev/null --max-time 2 --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:4000/api/health
+ExecStart=/opt/deployflow/node/bin/node node_modules/next/dist/bin/next start --hostname 127.0.0.1 --port 3000
+Restart=on-failure
+RestartSec=3s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

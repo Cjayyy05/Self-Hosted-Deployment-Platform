@@ -78,4 +78,30 @@ describe('project hosting status', () => {
       .mockResolvedValueOnce(new Map());
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
   });
+
+  it('returns a route-specific browser check after verified local TLS and rejects other projects', async () => {
+    const publicHostname = hostnameLabel + '.apps.example.net';
+    const routes = { readDashboardPorts: vi.fn().mockResolvedValue(new Map([[publicHostname, active.hostPort]])) };
+    const health = { waitUntilHealthy: vi.fn().mockResolvedValue(undefined) };
+    const service = new ProjectHostingService(routes, {
+      origin: 'https://apps.example.net', hostnameSuffix: 'apps.example.net', adminSocketPath: '/run/caddy/admin.sock',
+      publicApp: { projectId: '11111111-1111-4111-8111-111111111111', repositoryUrl: 'https://github.com/example/app',
+        branch: 'main', commits: new Set() },
+    }, health);
+    const verified = await service.summarize(project);
+    expect(verified).toMatchObject({
+      localApplicationUrl: null, publicApplicationUrl: 'https://' + publicHostname, hostingStatus: 'VERIFYING_HTTPS',
+    });
+    expect(verified.publicProbePath).toMatch(/^\/\.well-known\/deployflow-health\/[a-f0-9]{64}$/);
+    expect(health.waitUntilHealthy).toHaveBeenCalledWith({
+      hostPort: 443, hostname: publicHostname, path: '/health', https: true,
+    });
+    await expect(service.summarize({ ...project, hostnameLabel: 'other' }))
+      .resolves.toEqual({ localApplicationUrl: null, hostingStatus: 'DISABLED' });
+    routes.readDashboardPorts.mockResolvedValue(new Map([[publicHostname, active.hostPort]]));
+    health.waitUntilHealthy.mockRejectedValueOnce(new Error('certificate invalid'));
+    const unverified = await service.summarize(project);
+    expect(unverified.hostingStatus).toBe('RECOVERING');
+    expect(unverified.publicProbePath).toBeUndefined();
+  });
 });

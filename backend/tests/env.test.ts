@@ -28,6 +28,41 @@ describe('secret configuration', () => {
   });
 });
 
+describe('public hosting configuration', () => {
+  const config = {
+    origin: 'https://apps.example.net',
+    hostnameSuffix: 'apps.example.net',
+    adminSocketPath: '/run/deployflow-caddy/admin.sock',
+    publicProjectId: '11111111-1111-4111-8111-111111111111',
+    publicRepositoryUrl: 'https://github.com/example/app.git',
+    publicBranch: 'demo/v1',
+    publicCommits: 'a'.repeat(40) + ',' + 'b'.repeat(40),
+  };
+
+  it('requires the exact HTTPS suffix and a reviewed repository, branch and commit set on Linux', () => {
+    expect(parseHostingConfig(config, 'linux').publicApp).toMatchObject({
+      projectId: config.publicProjectId,
+      repositoryUrl: 'https://github.com/example/app',
+      branch: config.publicBranch,
+      commits: new Set(['a'.repeat(40), 'b'.repeat(40)]),
+    });
+  });
+
+  it('rejects missing approvals, invalid host settings and Windows public mode', () => {
+    for (const override of [
+      { publicCommits: undefined },
+      { publicCommits: 'abc' },
+      { adminSocketPath: undefined },
+      { publicBranch: '-main' },
+      { publicRepositoryUrl: 'https://example.com/example/app' },
+      { origin: 'https://wrong.example.net' },
+    ]) {
+      expect(() => parseHostingConfig({ ...config, ...override }, 'linux')).toThrow();
+    }
+    expect(() => parseHostingConfig(config, 'win32')).toThrow();
+  });
+});
+
 describe('local hosting configuration', () => {
   it('reserves a local address and disables admin by default', () => {
     expect(parseHostingConfig({})).toEqual({

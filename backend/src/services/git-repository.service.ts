@@ -3,8 +3,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { env, type PublicApplication } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
 import { parseGitHubRepositoryUrl } from '../utils/github-repository.js';
+import { assertApprovedCommit, assertApprovedSource } from './public-application-policy.js';
 
 const TEMPORARY_DIRECTORY_PREFIX = 'deployflow-repository-';
 const COMMIT_HASH_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
@@ -93,7 +95,8 @@ export class GitRepositoryService {
   readonly #runGit: GitCommandRunner;
   readonly #managedDirectories = new Set<string>();
 
-  public constructor(dependencies: GitRepositoryServiceDependencies = {}) {
+  public constructor(dependencies: GitRepositoryServiceDependencies = {},
+    private readonly approved: PublicApplication | undefined = env.hosting.publicApp) {
     this.#runGit = dependencies.runGit ?? executeGit;
   }
 
@@ -102,6 +105,7 @@ export class GitRepositoryService {
   ): Promise<PreparedGitRepository> {
     const repository = parseGitHubRepositoryUrl(input.repositoryUrl);
     const branch = parseBranch(input.branch);
+    assertApprovedSource(this.approved, { repositoryUrl: repository.repositoryUrl, branch });
     let repositoryPath: string;
 
     try {
@@ -146,6 +150,7 @@ export class GitRepositoryService {
       if (!COMMIT_HASH_PATTERN.test(commitHash)) {
         throw new AppError(422, 'Repository returned an invalid commit hash');
       }
+      assertApprovedCommit(this.approved, commitHash.toLowerCase());
 
       return {
         repositoryPath,
@@ -182,10 +187,12 @@ export class GitRepositoryService {
     const repository = parseGitHubRepositoryUrl(input.repositoryUrl);
     const branch = parseBranch(input.branch);
     const commitHash = input.commitHash.trim().toLowerCase();
+    assertApprovedSource(this.approved, { repositoryUrl: repository.repositoryUrl, branch });
 
     if (!COMMIT_HASH_PATTERN.test(commitHash)) {
       throw new AppError(400, 'Repository commit hash is invalid');
     }
+    assertApprovedCommit(this.approved, commitHash);
 
     let repositoryPath: string;
 

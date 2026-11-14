@@ -1,9 +1,11 @@
 import { database } from '../config/database.js';
+import { env } from '../config/env.js';
 import {
   DeploymentStatus,
   type DeploymentStatus as DeploymentStatusValue,
 } from '../generated/prisma/enums.js';
 import { AppError } from '../utils/app-error.js';
+import { assertApprovedCommit, assertApprovedSource } from './public-application-policy.js';
 import { applicationHealthCheckService } from './application-health-check.service.js';
 import {
   applicationDetector,
@@ -354,6 +356,8 @@ export class DeploymentService {
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
+    assertApprovedSource(env.hosting.publicApp, { ...deployment.project, id: deployment.projectId });
+    assertApprovedCommit(env.hosting.publicApp, deployment.commitHash);
     const containerId = this.#requireContainerId(deployment);
     let containerRestarted = false;
     const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
@@ -622,6 +626,7 @@ export class DeploymentService {
     }
 
     if (project === null) throw new AppError(404, 'Project not found');
+    assertApprovedSource(env.hosting.publicApp, project);
 
     let deployment: DeploymentRecord;
 
@@ -773,6 +778,8 @@ export class DeploymentService {
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
+    assertApprovedSource(env.hosting.publicApp, { ...sourceDeployment.project, id: sourceDeployment.projectId });
+    assertApprovedCommit(env.hosting.publicApp, sourceDeployment.commitHash);
     const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
     if (hostingLease !== undefined) await this.#routing?.assertIdle(sourceDeployment.projectId, hostingLease);
     const commitHash = sourceDeployment.commitHash;

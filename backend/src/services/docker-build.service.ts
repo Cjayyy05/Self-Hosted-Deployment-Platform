@@ -5,6 +5,7 @@ import { type Ignore } from '@balena/dockerignore';
 import Dockerode from 'dockerode';
 import tar from 'tar-fs';
 
+import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
 
 const UUID_PATTERN =
@@ -46,6 +47,13 @@ type DockerBuildOptions = {
   t: string;
   rm: boolean;
   forcerm: boolean;
+  version?: '1';
+  memory?: number;
+  memswap?: number;
+  cpuperiod?: number;
+  cpuquota?: number;
+  networkmode?: 'bridge';
+  cgroupparent?: string;
 };
 
 type DockerBuildStream = NodeJS.ReadableStream & {
@@ -207,14 +215,30 @@ const validateRepositoryDirectory = async (
 
 export class DockerBuildService {
   readonly #docker: DockerClient;
+  #building = false;
 
   public constructor(
     docker: DockerClient = new Dockerode() as unknown as DockerClient,
+    private readonly linuxHosting = env.hosting.publicApp !== undefined,
   ) {
     this.#docker = docker;
   }
 
   public async buildImage(
+    input: DockerBuildInput,
+    onOutput?: DockerBuildOutputCallback,
+  ): Promise<DockerBuildResult> {
+    if (!this.linuxHosting) return this.#buildImage(input, onOutput);
+    if (this.#building) throw new AppError(409, 'Another image build is already running');
+    this.#building = true;
+    try {
+      return await this.#buildImage(input, onOutput);
+    } finally {
+      this.#building = false;
+    }
+  }
+
+  async #buildImage(
     input: DockerBuildInput,
     onOutput?: DockerBuildOutputCallback,
   ): Promise<DockerBuildResult> {
@@ -233,6 +257,17 @@ export class DockerBuildService {
         t: imageTag,
         rm: true,
         forcerm: true,
+        // The classic API applies these limits to RUN containers. The
+        // deployflow-build systemd slice also bounds aggregate build tasks.
+        ...(this.linuxHosting ? {
+          version: '1',
+          memory: 1536 * 1024 * 1024,
+          memswap: 1536 * 1024 * 1024,
+          cpuperiod: 100_000,
+          cpuquota: 100_000,
+          networkmode: 'bridge',
+          cgroupparent: 'deployflow-build.slice',
+        } as const : {}),
       });
       buildStream = activeBuildStream;
 

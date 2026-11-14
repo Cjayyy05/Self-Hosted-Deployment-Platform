@@ -40,6 +40,16 @@ function fixture(initial: unknown[] = [fallback]) {
 }
 
 describe('ApplicationRoutingService', () => {
+  it('limits public route writes to the configured project and verifies read-back', async () => {
+    const { transport, docker } = fixture();
+    const service = new ApplicationRoutingService(transport, 'apps.example.net', docker, project);
+    await expect(service.upsert(second, container)).rejects.toMatchObject({ code: 'rejected' });
+    expect(transport).not.toHaveBeenCalled();
+    await service.upsert(project, container, { healthPath: '/ready' });
+    expect(await service.readPort(project)).toBe(49153);
+    await service.remove(project);
+    expect(await service.readPort(project)).toBeNull();
+  });
   it('uses exact hosts and the inspected port, serializes projects, and preserves the final 404', async () => {
     const { service, transport, docker } = fixture();
     await Promise.all([service.upsert(project, container), service.upsert(second, container)]);

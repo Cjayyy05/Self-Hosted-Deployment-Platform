@@ -2,6 +2,8 @@
 
 Each project has a permanent hostname label derived from its UUID. The dashboard shows the reserved URL as **Local only · HTTP** and enables **Open Application** after confirming that Caddy routes to the active deployment and the application answers its health check. Public DNS and HTTPS require a separate hosting setup.
 
+For the single-instance Ubuntu and EC2 setup, see the [EC2 hosting runbook](aws-ec2-hosting.md).
+
 ## Configuration
 
 Set `APP_HOSTING_ORIGIN=http://localhost:8080` for the listener's HTTP scheme and port, and `APP_HOSTNAME_SUFFIX=localhost` for the project hostnames. For example, the project with UUID `11111111-1111-4111-8111-111111111111` reserves `http://app-11111111111141118111111111111111.localhost:8080`. An alternate suffix requires local name resolution to the loopback listener. Keep `CADDY_ADMIN_SOCKET` unset if the local hosting configuration is disabled.

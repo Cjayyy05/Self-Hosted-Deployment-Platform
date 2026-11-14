@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { database } from '../config/database.js';
+import { env } from '../config/env.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import { AppError } from '../utils/app-error.js';
 import { projectHostnameLabel } from '../utils/project-hostname.js';
@@ -65,6 +66,9 @@ export const createProject = async (
   userId: string,
   data: CreateProjectData,
 ) => {
+  if (env.hosting.publicApp !== undefined) {
+    throw new AppError(403, 'Create the approved project privately before enabling public hosting');
+  }
   const id = randomUUID();
   const project = await database.project.create({
     data: { ...data, id, hostnameLabel: projectHostnameLabel(id), userId },
