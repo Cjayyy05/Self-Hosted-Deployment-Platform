@@ -141,8 +141,21 @@ describe('ContainerService', () => {
     });
   });
 
-  it('creates and starts a container with a Docker-assigned host port', async () => {
-    const service = new ContainerService(docker);
+  it.each([
+    { mode: 'default or private hosting', linuxHosting: undefined, limits: {} },
+    {
+      mode: 'Linux public hosting',
+      linuxHosting: true,
+      limits: {
+        Memory: 536_870_912,
+        MemorySwap: 536_870_912,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 128,
+        SecurityOpt: ['no-new-privileges:true'],
+      },
+    },
+  ])('starts a $mode container with a Docker-assigned port and restart policy', async ({ linuxHosting, limits }) => {
+    const service = new ContainerService(docker, undefined, linuxHosting);
 
     const result = await service.startContainer({
       imageIdentifier: 'deployflow/example:latest',
@@ -162,6 +175,8 @@ describe('ContainerService', () => {
           Type: 'json-file',
           Config: { 'max-size': '10m', 'max-file': '3' },
         },
+        RestartPolicy: { Name: 'unless-stopped' },
+        ...limits,
       },
       Labels: { 'deployflow.deployment-id': deploymentId },
     });

@@ -179,6 +179,11 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       if (id === null) throw new Error('Expected an active deployment');
       return database.deployment.findUniqueOrThrow({ where: { id } });
     };
+    const expectContainerState = async (id: string | null, running: boolean) => {
+      if (id === null) throw new Error('Expected a fixture container');
+      const { stdout } = await docker('inspect', '--format', '{{.HostConfig.RestartPolicy.Name}} {{.State.Running}}', id);
+      expect(stdout.trim()).toBe(`unless-stopped ${String(running)}`);
+    };
     const deploy = (id: string) => request(app).post('/api/projects/' + id + '/deploy').set('Authorization', auth);
     const action = (id: string, kind: string) => request(app).post('/api/deployments/' + id + '/' + kind).set('Authorization', auth);
     const expectHosting = async (p: { id: string; host: string }, status: string, activeId: string | null, latest?: string) => {
@@ -209,6 +214,7 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       const initial = await deploy(p.id);
       expect(initial.status, JSON.stringify(initial.body)).toBe(201);
       const first = await deployment(await active(p.id));
+      await expectContainerState(first.containerId, true);
       await expectBody(p.host, 'v1');
       await expectHosting(p, 'AVAILABLE', first.id, 'RUNNING');
       expect((await hit('unknown.localhost')).status).toBe(404);
@@ -222,6 +228,8 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       const second = await deployment(await active(p.id));
       expect(second.id).not.toBe(first.id);
       expect((await deployment(first.id)).status).toBe('STOPPED');
+      await expectContainerState(first.containerId, false);
+      await expectContainerState(second.containerId, true);
       await expectBody(p.host, 'v2');
       await expectHosting(p, 'AVAILABLE', second.id, 'RUNNING');
       expect(await active(other.id)).toBe(otherActive);
@@ -266,13 +274,17 @@ describe.skipIf(process.env.DEPLOYFLOW_PHASE3_SMOKE !== '1')('disposable deploym
       expect(rollback.status, JSON.stringify(rollback.body)).toBe(201);
       const rolledBack = await deployment(await active(p.id));
       expect(rolledBack.rollbackSourceDeploymentId).toBe(first.id);
+      await expectContainerState(second.containerId, false);
+      await expectContainerState(rolledBack.containerId, true);
       await expectBody(p.host, 'v1');
       await expectHosting(p, 'AVAILABLE', rolledBack.id, 'RUNNING');
       expect((await action(rolledBack.id, 'stop')).status).toBe(200);
+      await expectContainerState(rolledBack.containerId, false);
       expect(await active(p.id)).toBeNull();
       expect((await hit(p.host)).status).toBe(404);
       await expectHosting(p, 'UNAVAILABLE', null, 'STOPPED');
       expect((await action(rolledBack.id, 'restart')).status).toBe(200);
+      await expectContainerState(rolledBack.containerId, true);
       expect(await active(p.id)).toBe(rolledBack.id);
       await expectBody(p.host, 'v1');
       await expectHosting(p, 'AVAILABLE', rolledBack.id, 'RUNNING');

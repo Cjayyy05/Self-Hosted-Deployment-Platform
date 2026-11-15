@@ -12,13 +12,13 @@ const DEFAULT_LOG_TAIL = 1_000;
 const MAX_LOG_TAIL = 10_000;
 const MAX_LOG_RESPONSE_BYTES = 1024 * 1024;
 const TRUNCATED_LOG_PREFIX = '[Earlier log output truncated]\n';
+const WORKLOAD_RESTART_POLICY = 'unless-stopped';
 const LINUX_WORKLOAD_LIMITS = {
   Memory: 512 * 1024 * 1024,
   MemorySwap: 512 * 1024 * 1024,
   NanoCpus: 1_000_000_000,
   PidsLimit: 128,
   SecurityOpt: ['no-new-privileges:true'],
-  RestartPolicy: { Name: 'unless-stopped' },
 } as const;
 
 export type StartContainerInput = {
@@ -81,7 +81,7 @@ export type ContainerCreateOptions = {
     NanoCpus?: number;
     PidsLimit?: number;
     SecurityOpt?: readonly string[];
-    RestartPolicy?: { Name: 'unless-stopped' };
+    RestartPolicy: { Name: typeof WORKLOAD_RESTART_POLICY };
   };
   Labels: Record<string, string>;
 };
@@ -143,7 +143,7 @@ const assertLinuxWorkloadLimits = (details: ContainerInspectResult): void => {
   const config = details.HostConfig;
   if (config?.Memory !== LINUX_WORKLOAD_LIMITS.Memory ||
     config.MemorySwap !== LINUX_WORKLOAD_LIMITS.MemorySwap || config.NanoCpus !== LINUX_WORKLOAD_LIMITS.NanoCpus ||
-    config.PidsLimit !== LINUX_WORKLOAD_LIMITS.PidsLimit || config.RestartPolicy?.Name !== 'unless-stopped' ||
+    config.PidsLimit !== LINUX_WORKLOAD_LIMITS.PidsLimit || config.RestartPolicy?.Name !== WORKLOAD_RESTART_POLICY ||
     !config.SecurityOpt?.includes('no-new-privileges:true') || config.Privileged !== false ||
     (config.NetworkMode !== 'bridge' && config.NetworkMode !== 'default') ||
     config.Binds?.length || config.Mounts?.length || config.VolumesFrom?.length) {
@@ -356,6 +356,7 @@ export class ContainerService {
             Type: 'json-file',
             Config: { 'max-size': '10m', 'max-file': '3' },
           },
+          RestartPolicy: { Name: WORKLOAD_RESTART_POLICY },
           ...(this.linuxHosting ? LINUX_WORKLOAD_LIMITS : {}),
         },
         Labels: { 'deployflow.deployment-id': input.deploymentId },
