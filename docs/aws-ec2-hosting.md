@@ -160,7 +160,7 @@ aws ssm start-session --target "<instance-id>" --region ap-southeast-2 --profile
 
 ## Public cutover after separate approvals
 
-1. After public exposure, DNS, and the Elastic IP are authorized, associate the Elastic IP and reconnect SSH at the new address. Publish an exact A record for the project hostname in a zone you control. Verify its public answers and check CAA, if present. Open inbound TCP 80 and 443 and preserve the existing SSH `/32` rule while SSH is the operator access path.
+1. After public exposure and DNS are authorized, confirm the instance's public IPv4 and publish an exact A record for the approved project hostname in a zone you control. Verify its public answers and check CAA, if present. After separate ingress approval, open inbound TCP 80 and 443 and preserve the existing SSH `/32` rule. For the Hello World deployment with an auto-assigned IPv4, use the [EC2 stop/start recovery checklist](#ec2-stopstart-recovery-checklist).
 2. Set `APP_HOSTNAME_SUFFIX=apps.<your-domain>`, `APP_HOSTING_ORIGIN=https://apps.<your-domain>`, `APP_PUBLIC_PROJECT_ID`, `APP_PUBLIC_REPOSITORY_URL`, `APP_PUBLIC_BRANCH`, and `APP_PUBLIC_COMMITS` (comma-separated lowercase full SHA-1s). The project must already exist in the database. Approve each source revision before deploying and retain the prior approved revision during rollback testing. Public mode rejects new projects. Repositories, image base tags and network dependencies remain trusted inputs, so pin dependencies for the fixture.
 3. Render the Caddy template with the exact approved hostname. For the certificate rehearsal, add a staging ACME policy, then restore the rendered production config. The backend and browser require trusted certificates for availability. Stop the backend during cutover, start Caddy with the rendered config, and start the backend after Caddy comes up.
 
@@ -176,24 +176,121 @@ aws ssm start-session --target "<instance-id>" --region ap-southeast-2 --profile
    Install the selected file as `/etc/deployflow/caddy.json` and restart `deployflow-caddy`. Review the Caddy journal for issuance. Repeat with the production config before testing the app.
 4. Deploy through the private dashboard. Confirm the browser reports **Available** and an external network resolves the hostname, receives the HTTP redirect and validates the TLS chain. Fetch the application and its expected version, then check the same URL across successful redeploy, failed redeploy, rollback, restart, and EC2 stop/start. From outside the SSH allowlist, connections to 22, 2019, 2375, 2376, 3000, 4000, 5432, 8080, and the inspected application host port should fail. Confirm that public requests do not reach the management API or webhook handlers. Repeat the socket checks after Caddy reload or restart.
 
-## Backup, restore and shutdown
+## EC2 stop/start recovery checklist
 
-1. **Export a backup over SSH.** Pause deployment changes and run the following from an operator SSH shell on the host. The dump works while PostgreSQL is running. Export Caddy storage only if it contains material you need for recovery. Save the reviewed release ID, mount configuration, Caddy config, and service settings. Preserve secrets separately in encrypted operator-controlled storage.
+### Before a planned stop
 
-   ```sh
-   umask 077
-   backup_dir=$(mktemp -d "$HOME/deployflow-backup.XXXXXXXX") &&
-     sudo -u postgres pg_dump --format=custom --dbname=deployflow > "$backup_dir/database.dump" &&
-     (cd "$backup_dir" && sha256sum database.dump > SHA256SUMS) &&
-     printf '%s\n' "$backup_dir"
+1. Schedule the public outage. In the private dashboard, verify the approved Hello World deployment is **Running**, its route is available, and no build, deployment, or routing operation is pending. Confirm no migration is running. Verify a recent recovery backup and record the active deployment ID, commit, image ID, and public hostname.
+2. On the host, confirm PostgreSQL and the DeployFlow services are healthy, the 40 GiB volume is mounted at `/srv/deployflow`, and the running Hello World container is healthy with restart policy `unless-stopped`. Leave Hello World running so Docker can recover it after boot. Use the dashboard's **Stop** action only if the application must remain stopped.
+3. Use the normal **Stop instance** action in the EC2 console and allow OS shutdown. Wait for **Stopped**. The logical backup, Docker state, PostgreSQL data and Caddy certificate storage are retained on EBS. The auto-assigned public IPv4 is released. [EC2 stop and start behavior](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/how-ec2-instance-stop-start-works.html)
+
+### Start EC2 and verify host recovery
+
+1. In the Sydney EC2 console, start `i-0e3acc2a37a75dc07`. Wait for **Running** and all status checks to pass. Record the **Public IPv4 address** from this instance's details. With an authorized AWS CLI profile, cross-check the same field.
+
+   ```powershell
+   aws ec2 describe-instances --region ap-southeast-2 --instance-ids i-0e3acc2a37a75dc07 --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress]' --output table
    ```
 
-   If needed, add `sudo tar -C /srv/deployflow -czf - caddy > "$backup_dir/caddy.tar.gz"` and regenerate `SHA256SUMS` for both files. Use `scp -r -o StrictHostKeyChecking=yes -i "<path-to-private-key>" "ubuntu@<instance-public-ipv4>:<printed-backup-directory>" "<encrypted-local-destination>"` from the workstation. Verify `sha256sum -c SHA256SUMS` in the downloaded directory, or compare SHA-256 values with `Get-FileHash -Algorithm SHA256` in PowerShell. Remove host staging files after verifying the copy. Export before credits run out or the Free Plan expires.
+2. Connect as `ubuntu` at that IPv4 using the existing PEM and strict host-key checking. If the IPv4 changed, use `HostKeyAlias` pointing to the previously trusted `known_hosts` entry for this instance. Verify its ED25519 fingerprint is `SHA256:ZdQy3QZZhoCLe0vtMLo2OmfqZZ14jp2sQ7G13VkE7Ek`. Stop on a mismatch. Reopen the [private dashboard tunnels](#private-startup-and-operator-access) to the verified address.
+3. Confirm the data mount is backed by EBS volume `vol-030d18526253cca41` (its NVMe serial omits the hyphen) and filesystem UUID `cc22c868-8919-4307-a590-57f8f3d72e9a`. If it is missing or wrong, stop recovery before starting dependent services or writing data there. Do not initialize or format the volume.
+
+   ```sh
+   findmnt -no SOURCE,UUID,TARGET --mountpoint /srv/deployflow
+   lsblk -o NAME,SIZE,SERIAL,UUID,MOUNTPOINTS
+   sudo systemctl is-active postgresql@16-main docker deployflow-firewall deployflow-caddy deployflow-backend deployflow-frontend
+   sudo -u postgres pg_isready
+   curl --fail --silent --show-error http://127.0.0.1:4000/api/health
+   curl --fail --silent --show-error http://127.0.0.1:3000/backend-api/health
+   sudo ss -lntp
+   ```
+
+4. Verify the dashboard over SSH, the same active Hello World deployment and revision, and the previously stopped deployment's **Stopped** state. Inspect the active container using its deployment ID. Public listeners should be limited to SSH and Caddy on TCP 80/443. Verify dashboard, API, PostgreSQL and the container's published port are bound to loopback and Docker and Caddy administration use Unix sockets. If Caddy initially returns 404, give the backend time to reconcile the route, then check both journals if it persists.
+
+   ```sh
+   deployment_id='<active-deployment-id>'
+   sudo docker inspect --format '{{.State.Status}} {{.State.Health.Status}} {{.HostConfig.RestartPolicy.Name}} {{.Image}}' "deployflow-deployment-$deployment_id"
+   sudo journalctl -b -u deployflow-caddy -u deployflow-backend --no-pager -n 100
+   ```
+
+### Update dynv6 only if the public IPv4 changed
+
+1. Compare the current EC2 public IPv4 against the public A record for `app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net`. If they differ, sign in to dynv6 and edit the existing exact A record for this hostname. Set its target to the new IPv4 from EC2 and save. Leave unrelated records and the zone apex alone. This IPv4-only deployment should have no AAAA record for the hostname. Keep dynv6 credentials and update tokens out of commands, logs, and Git. [dynv6 DNS documentation](https://dynv6.com/docs/apis)
+2. Query two public resolvers. Wait out the old TTL if either still returns the old address. Continue once both A answers contain only the new IPv4 and neither returns an AAAA address for this host.
+
+   ```powershell
+   $site = 'app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net'
+   foreach ($resolver in '1.1.1.1', '8.8.8.8') {
+     Resolve-DnsName -Name $site -Type A -Server $resolver -DnsOnly
+     Resolve-DnsName -Name $site -Type AAAA -Server $resolver -DnsOnly
+   }
+   ```
+
+### Verify public HTTPS and the certificate
+
+From a workstation outside EC2, confirm HTTP redirects with **308** to the same hostname over HTTPS. Confirm HTTPS returns **200**, TLS verification succeeds, and the body contains `Hello World`.
+
+```powershell
+$site = 'app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net'
+curl.exe -4 -sS --max-time 15 -I "http://$site/"
+curl.exe -4 -fsS --max-time 15 -o NUL -w "HTTP %{http_code}, TLS verify %{ssl_verify_result}\n" "https://$site/"
+curl.exe -4 -fsS --max-time 15 "https://$site/" | Select-String -SimpleMatch 'Hello World'
+```
+
+In the browser's certificate viewer, check that the trusted issuer is Let's Encrypt, the SAN contains the exact approved hostname, and the validity dates cover the current time. Record the expiry. On a Linux workstation with OpenSSL, the following checks the chain and hostname. Use the public hostname so DNS is exercised.
+
+```sh
+site=app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net
+openssl s_client -connect "$site:443" -servername "$site" -verify_hostname "$site" -verify_return_error -brief </dev/null
+openssl s_client -connect "$site:443" -servername "$site" -verify_hostname "$site" -verify_return_error </dev/null |
+  openssl x509 -noout -issuer -dates -ext subjectAltName
+```
+
+If DNS is still converging, `curl.exe --resolve "${site}:443:<current-ec2-ip>" "https://$site/"` can isolate DNS from the HTTPS check while still validating the certificate. Repeat without the override before declaring recovery complete.
+
+### Check Caddy renewal
+
+Caddy renews automatically while the instance runs. A change of public IPv4 does not require a new certificate for the same hostname. Keep the encrypted EBS mount and `/srv/deployflow/caddy` available and writable by the Caddy service. The directory holds certificate keys and ACME account material. If EC2 is stopped during the renewal window, schedule a start with enough time to repair DNS or connectivity before expiry. A later expiry on the certificate served to external clients verifies renewal. [Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)
+
+```sh
+sudo systemctl is-active deployflow-caddy
+sudo -u caddy test -w /srv/deployflow/caddy
+df -h /srv/deployflow
+timedatectl status
+sudo journalctl -u deployflow-caddy --since '30 days ago' --no-pager |
+  grep -Ei 'tls\.renew|tls\.obtain|renew|challenge|acme|certificate'
+```
+
+- **Validation fails or times out.** Verify that public DNS resolves to the current IPv4 without a stale AAAA answer. Check public TCP 80 and 443, the attached security group, and the host firewall. HTTP-01 uses TCP 80 and TLS-ALPN-01 uses TCP 443. Check that Caddy can resolve and reach the production ACME endpoint over HTTPS, the clock is synchronized, and any inherited CAA allows Let's Encrypt. [Caddy troubleshooting](https://caddyserver.com/docs/troubleshooting)
+- **Storage or trust fails.** Check the EBS mount, free space, Caddy write access, the exact hostname in the production config, and the publicly served issuer. Verify the running service uses production ACME settings. Keep journal output private and redact it before sharing. Preserve existing Caddy storage and avoid repeated restarts or forced production issuance. Use an isolated staging rehearsal when diagnosing issuance or rate limits. [Let's Encrypt rate limits](https://letsencrypt.org/docs/rate-limits/)
+- **TLS succeeds but HTTPS returns 404.** Check the active deployment and backend route reconciliation in the private dashboard and journals. An unknown hostname should receive no application route. A trusted certificate alone does not establish that the Hello World route recovered.
+
+## Backup, restore and shutdown
+
+1. **Create and protect a backup.** Pause deployment changes and verify the encrypted data volume is mounted at `/srv/deployflow`. The dump works while PostgreSQL is running. Run the following from an operator SSH shell on the host.
+
+   ```sh
+   sudo bash -s <<'SH'
+   set -euo pipefail
+   umask 077
+   mountpoint -q /srv/deployflow
+   backup_dir=$(mktemp -d /srv/deployflow/backup/logical.XXXXXXXX)
+   runuser -u postgres -- pg_dump --format=custom --dbname=deployflow > "$backup_dir/database.dump"
+   cd "$backup_dir"
+   sha256sum database.dump > SHA256SUMS
+   sha256sum -c SHA256SUMS
+   printf '%s\n' "$backup_dir"
+   SH
+   ```
+
+   For an authorized off-instance copy, use pinned SSH and encrypt the stream at the destination before writing it to disk. Keep the destination outside the repository with access restricted to the operator. Verify the file hashes by decrypting the export in memory or in an isolated encrypted restore environment. Keep copies accessible before credits run out or the Free Plan expires.
 2. **Drill a logical restore.** Verify the backup checksums and restore into a new disposable database on a PostgreSQL 16 cluster. Re-create the roles, database ownership, default grants, and database-specific `pg_hba.conf` rule from host setup using the restore database name. Load credentials securely and restore as the migration role with `pg_restore --exit-on-error --no-owner --no-acl --host=127.0.0.1 --username=deployflow_migrator --dbname="<restore-database>" database.dump`. Revoke application access to `public._prisma_migrations` after restoring. Check the migration ledger, project and active deployment rows, and verify access with the application role. For live recovery, redeploy the recorded reviewed commit to recreate containers and routing if Docker state was lost.
 3. **Recover from a volume or host failure.** If an EBS snapshot is authorized, take it after a clean shutdown for consistent on-disk PostgreSQL, Docker and Caddy state. For replacement, provision a clean host with the recorded release and compatible package versions. Attach the retained data volume in the same Availability Zone or create an encrypted gp3 volume from the snapshot in the replacement host's Availability Zone. Snapshots encrypted with `aws/ebs` are for same-account recovery. Mount the existing filesystem by UUID before starting services. Use only one copy of a given filesystem UUID on the replacement host. Skip fresh-cluster initialization on restored data, restore root-volume configuration separately, and recheck ownership, migrations, routing, and SSH smoke tests. If restoring Caddy from an archive, recover `caddy:caddy` ownership and restricted permissions. [Restore an EBS volume from a snapshot](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-restoring-volume.html), [EBS snapshot sharing rules](https://docs.aws.amazon.com/ebs/latest/userguide/ebs-modifying-snapshot-permissions.html)
 4. **Recover SSH access.** Check EC2 status checks, current public IPv4, the subnet route, and the operator's current `/32`. Verify any new host key against EC2 console output. If the key is lost and there is no working session, recover through an authorized same-AZ rescue instance or rebuild using a new key pair and the retained data volume or backup. [EC2 connection troubleshooting](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/TroubleshootingInstancesConnecting.html)
 5. **Roll back.** Roll back to the previous successful deployment from the private dashboard and verify the served version. Keep its image until acceptance. For platform rollback, stop the Node services, repoint the release symlink to a prior schema-compatible release, and restart. If the older release requires an older schema, restore a matching backup into a separate database and verify it before switching. Restore the previous Caddy config with a controlled restart so the backend can reconcile the committed route.
-6. **Stop or tear down.** Let builds and route changes settle. Stop the application explicitly if it should remain offline. Stop the frontend and backend, then Caddy, Docker including its socket, and PostgreSQL. Stop EC2 normally. On restart, verify the new IP, data mount, service states, and private route. For authorized teardown, verify the off-instance backup, terminate EC2, and check for retained volumes and snapshots in Sydney. Delete approved leftovers after recovery checks. If public cutover or S3 was enabled later, also check for a stale DNS record, allocated Elastic IP, and retained S3 objects. Review Billing after cleanup.
+6. **Stop or tear down.** For a routine stop, use the [EC2 stop/start recovery checklist](#ec2-stopstart-recovery-checklist). For authorized teardown, verify the off-instance backup, terminate EC2, and check for retained volumes and snapshots in Sydney. Delete approved leftovers after recovery checks. If public cutover or S3 was enabled, also check for a stale DNS record, any allocated Elastic IP, and retained S3 objects. Review Billing after cleanup.
+
+For a public deployment, keep a post-activation backup with a PostgreSQL custom-format dump, active Caddy bootstrap configuration, private backend and migration settings, mount and service configuration, Caddy's persistent storage, the approved Docker image, and a manifest with the installed release and active deployment identifiers. The backend reconstructs the dynamic Caddy route from database state. Verify checksums and run an isolated PostgreSQL restore before relying on the backup. Check that the archived certificate matches the served leaf and its archived key. Keep the backup directory root-owned with mode `0700` and its files mode `0600` on encrypted storage. The dump includes operator account data, and the configuration and Caddy archives may contain credentials and private keys. Use an approved encrypted transfer for off-instance recovery and keep these artifacts out of Git. A backup on the same EBS volume survives a normal stop/start but shares the data volume's failure risk.
 
 S3 automation is optional after a separate approval. Confirm the private bucket, Block Public Access, default encryption and a 14-day lifecycle for current and retained noncurrent backup objects. Give the host only the required write access to its backup prefix. Use an operator identity for restores and deletion. Set `DEPLOYFLOW_BACKUP_BUCKET` and `AWS_REGION=ap-southeast-2` in the root-only `/etc/deployflow/backup.env` after installing AWS CLI v2. Run `deployflow-backup.service` once, verify an uploaded backup, then enable `deployflow-backup.timer`. Keep an off-account copy if the data is needed after Free Plan expiry.
 
