@@ -71,6 +71,8 @@ jobs:
           sudo systemctl restart postgresql@16-main
           sudo -u postgres psql -p 55437 -v ON_ERROR_STOP=1 -c "CREATE ROLE deployflow_fixture LOGIN PASSWORD 'phase5b-disposable-only'"
           sudo -u postgres createdb -p 55437 -O deployflow_fixture deployflow_phase5b
+          sudo -u postgres createdb -p 55437 -O deployflow_fixture deployflow_phase1
+          DEPLOYFLOW_PHASE1_TEST_DB=postgresql://deployflow_fixture:phase5b-disposable-only@127.0.0.1:55437/deployflow_phase1 npm exec -- vitest run tests/public-approval.integration.test.ts
           asset=caddy_2.11.9_linux_amd64.tar.gz
           release=https://github.com/caddyserver/caddy/releases/download/v2.11.9
           curl -fsSLO "$release/$asset"

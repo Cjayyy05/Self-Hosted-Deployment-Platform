@@ -2,10 +2,13 @@ import Dockerode from 'dockerode';
 
 import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
+import { isWorkloadAddress, RESERVED_WORKLOAD_PORT } from '../utils/workload-address.js';
+import { dockerDeadline } from './docker-deadline.js';
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const CONTAINER_ID_PATTERN = /^[0-9a-f]{12,64}$/i;
+const FULL_CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/i;
 const HOST_PORT_PATTERN = /^\d{1,5}$/;
 const MAX_IMAGE_IDENTIFIER_LENGTH = 512;
 const DEFAULT_LOG_TAIL = 1_000;
@@ -13,6 +16,8 @@ const MAX_LOG_TAIL = 10_000;
 const MAX_LOG_RESPONSE_BYTES = 1024 * 1024;
 const TRUNCATED_LOG_PREFIX = '[Earlier log output truncated]\n';
 const WORKLOAD_RESTART_POLICY = 'unless-stopped';
+const SHUTDOWN_GRACE_SECONDS = 30;
+const LIFECYCLE_DEADLINE_MS = 45_000;
 const LINUX_WORKLOAD_LIMITS = {
   Memory: 512 * 1024 * 1024,
   MemorySwap: 512 * 1024 * 1024,
@@ -25,6 +30,7 @@ export type StartContainerInput = {
   imageIdentifier: string;
   containerPort: number;
   deploymentId: string;
+  hostAddress?: string;
 };
 
 export type ContainerRuntimeStatus = {
@@ -35,12 +41,14 @@ export type ContainerRuntimeStatus = {
 
 export type StartContainerResult = ContainerRuntimeStatus & {
   hostPort: number;
+  hostAddress?: string;
 };
 
 export type RoutingContainer = {
   containerId: string;
   deploymentId: string;
   containerPort: number;
+  hostAddress?: string;
 };
 
 export type ContainerLogsOptions = {
@@ -67,6 +75,7 @@ export type ContainerUptime = {
 };
 
 export type ContainerCreateOptions = {
+  abortSignal?: AbortSignal;
   name: string;
   Image: string;
   ExposedPorts: Record<string, Record<string, never>>;
@@ -110,16 +119,17 @@ type ContainerInspectResult = {
     Binds?: unknown[] | null;
     Mounts?: unknown[] | null;
     VolumesFrom?: unknown[] | null;
+    PortBindings?: Record<string, unknown> | null;
   };
 };
 
 export type DockerContainer = {
   id: string;
-  start: () => Promise<unknown>;
-  stop: () => Promise<unknown>;
-  restart: () => Promise<unknown>;
-  remove: (options: { force: boolean }) => Promise<unknown>;
-  inspect: () => Promise<ContainerInspectResult>;
+  start: (options?: { abortSignal: AbortSignal }) => Promise<unknown>;
+  stop: (options?: { abortSignal: AbortSignal; t: number }) => Promise<unknown>;
+  restart: (options?: { abortSignal: AbortSignal; t: number }) => Promise<unknown>;
+  remove: (options: { force: boolean; abortSignal?: AbortSignal }) => Promise<unknown>;
+  inspect: (options?: { abortSignal: AbortSignal }) => Promise<ContainerInspectResult>;
   logs: (options: {
     stdout: boolean;
     stderr: boolean;
@@ -134,6 +144,7 @@ export type DockerClient = {
   modem?: { getSocketPath?: () => Promise<string | undefined> | string | undefined };
   createContainer: (options: ContainerCreateOptions) => Promise<DockerContainer>;
   getContainer: (id: string) => DockerContainer;
+  listContainers: (options: { all: true; filters?: { label: string[] }; abortSignal?: AbortSignal }) => Promise<{ Id: string }[]>;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -229,6 +240,20 @@ const toOperationError = (error: unknown, message: string): AppError => {
   return new AppError(statusCode, message);
 };
 
+export class ContainerLifecyclePendingError extends AppError {
+  constructor() {
+    super(503, 'Docker lifecycle operation outcome is unconfirmed; verify container state before retrying');
+  }
+}
+
+const lifecycleFailure = (error: unknown, message: string): AppError => {
+  if (error instanceof AppError) return error;
+  if (isRecord(error) && typeof error.statusCode === 'number' && error.statusCode >= 400 && error.statusCode < 500) {
+    return toOperationError(error, message);
+  }
+  return new ContainerLifecyclePendingError();
+};
+
 const readRuntimeStatus = (
   inspectResult: ContainerInspectResult,
   fallbackId: string,
@@ -245,6 +270,12 @@ const readRuntimeStatus = (
   }
 
   return { containerId, status, running };
+};
+
+const assertDeploymentContainerOwnership = (details: ContainerInspectResult, containerId: string, deploymentId: string) => {
+  if (details.Id !== containerId || details.Config?.Labels?.['deployflow.deployment-id'] !== deploymentId) {
+    throw new AppError(422, 'Docker could not verify deployment container ownership');
+  }
 };
 
 const readHostPort = (
@@ -269,6 +300,21 @@ const readHostPort = (
   }
 
   return hostPort;
+};
+
+const assertAddress = (bindings: unknown, hostAddress: string) => {
+  if (!Array.isArray(bindings) || bindings.length !== 1 || !isRecord(bindings[0]) || bindings[0].HostIp !== hostAddress ||
+    (isWorkloadAddress(hostAddress) && bindings[0].HostPort !== String(RESERVED_WORKLOAD_PORT))) {
+    throw new AppError(422, 'Docker did not verify the reserved IPv4 loopback binding');
+  }
+};
+
+const assertPublishedAddress = (details: ContainerInspectResult, port: number, hostAddress: string) => {
+  assertAddress(details.NetworkSettings?.Ports?.[String(port) + '/tcp'], hostAddress);
+};
+
+const assertRequestedAddress = (details: ContainerInspectResult, port: number, hostAddress: string) => {
+  assertAddress(details.HostConfig?.PortBindings?.[String(port) + '/tcp'], hostAddress);
 };
 
 const decodeDockerLogs = (logs: Buffer | string): string => {
@@ -328,9 +374,9 @@ export class ContainerService {
   readonly #now: () => number;
 
   public constructor(
-    docker: DockerClient = new Dockerode() as unknown as DockerClient,
+    docker: DockerClient = new Dockerode({ timeout: LIFECYCLE_DEADLINE_MS }) as unknown as DockerClient,
     now: () => number = Date.now,
-    private readonly linuxHosting = env.hosting.publicApp !== undefined,
+    private readonly linuxHosting = env.hosting.publicHosting !== undefined,
   ) {
     this.#docker = docker;
     this.#now = now;
@@ -338,19 +384,24 @@ export class ContainerService {
 
   public async startContainer(
     rawInput: StartContainerInput,
+    beforeStart?: (containerId: string) => Promise<void>,
   ): Promise<StartContainerResult> {
     const input = parseStartInput(rawInput);
+    const hostAddress = rawInput.hostAddress ?? '127.0.0.1';
+    if (rawInput.hostAddress !== undefined && !isWorkloadAddress(hostAddress)) {
+      throw new AppError(422, 'Invalid reserved Docker bind address');
+    }
     const portKey = `${String(input.containerPort)}/tcp`;
     let container: DockerContainer | undefined;
 
     try {
-      container = await this.#docker.createContainer({
+      const createOptions: ContainerCreateOptions = {
         name: `deployflow-deployment-${input.deploymentId}`,
         Image: input.imageIdentifier,
         ExposedPorts: { [portKey]: {} },
         HostConfig: {
           PortBindings: {
-            [portKey]: [{ HostIp: '127.0.0.1', HostPort: '' }],
+            [portKey]: [{ HostIp: hostAddress, HostPort: rawInput.hostAddress === undefined ? '' : String(RESERVED_WORKLOAD_PORT) }],
           },
           LogConfig: {
             Type: 'json-file',
@@ -360,13 +411,18 @@ export class ContainerService {
           ...(this.linuxHosting ? LINUX_WORKLOAD_LIMITS : {}),
         },
         Labels: { 'deployflow.deployment-id': input.deploymentId },
-      });
-      await container.start();
+      };
+      container = await dockerDeadline((options) => this.#docker.createContainer({ ...createOptions, ...options }));
+      await beforeStart?.(container.id);
+      const created = container;
+      await dockerDeadline((options) => created.start(options));
 
-      const details = await container.inspect();
+      const details = await dockerDeadline((options) => created.inspect(options));
+      if (rawInput.hostAddress !== undefined) assertPublishedAddress(details, input.containerPort, hostAddress);
       return {
         ...readRuntimeStatus(details, container.id),
         hostPort: readHostPort(details, input.containerPort),
+        ...(rawInput.hostAddress === undefined ? {} : { hostAddress }),
       };
     } catch (error: unknown) {
       if (container !== undefined) await this.#cleanupFailedContainer(container);
@@ -380,30 +436,41 @@ export class ContainerService {
     const container = this.#getContainer(rawContainerId);
 
     try {
-      await container.stop();
-      return readRuntimeStatus(await container.inspect(), container.id);
+      await dockerDeadline((options) => container.stop({ ...options, t: SHUTDOWN_GRACE_SECONDS }), LIFECYCLE_DEADLINE_MS);
+      const runtime = readRuntimeStatus(await dockerDeadline((options) => container.inspect(options)), container.id);
+      if (runtime.running || runtime.status === 'restarting') throw new ContainerLifecyclePendingError();
+      return runtime;
     } catch (error: unknown) {
-      throw toOperationError(error, 'Unable to stop container');
+      throw lifecycleFailure(error, 'Unable to stop container');
     }
   }
 
   public async restartContainer(
     rawContainerId: string,
     rawContainerPort: number,
+    hostAddress?: string,
   ): Promise<StartContainerResult> {
     const container = this.#getContainer(rawContainerId);
     const containerPort = parseContainerPort(rawContainerPort);
 
     try {
-      if (this.linuxHosting) assertLinuxWorkloadLimits(await container.inspect());
-      await container.restart();
-      const details = await container.inspect();
+      if (this.linuxHosting) {
+        const previous = await dockerDeadline((options) => container.inspect(options));
+        assertLinuxWorkloadLimits(previous);
+        assertRequestedAddress(previous, containerPort, hostAddress ?? '127.0.0.1');
+      }
+      await dockerDeadline((options) => container.restart({ ...options, t: SHUTDOWN_GRACE_SECONDS }), LIFECYCLE_DEADLINE_MS);
+      const details = await dockerDeadline((options) => container.inspect(options));
+      const runtime = readRuntimeStatus(details, container.id);
+      if (!runtime.running || runtime.status !== 'running') throw new ContainerLifecyclePendingError();
+      if (hostAddress !== undefined) assertPublishedAddress(details, containerPort, hostAddress);
       return {
-        ...readRuntimeStatus(details, container.id),
+        ...runtime,
         hostPort: readHostPort(details, containerPort),
+        ...(hostAddress === undefined ? {} : { hostAddress }),
       };
     } catch (error: unknown) {
-      throw toOperationError(error, 'Unable to restart container');
+      throw lifecycleFailure(error, 'Unable to restart container');
     }
   }
 
@@ -411,10 +478,77 @@ export class ContainerService {
     const container = this.#getContainer(rawContainerId);
 
     try {
-      await container.remove({ force: true });
+      await dockerDeadline((options) => container.remove({ ...options, force: true }));
     } catch (error: unknown) {
       throw toOperationError(error, 'Unable to remove container');
     }
+  }
+
+  public async removeDeploymentContainers(
+    deploymentId: string,
+    containerId: string | null,
+    beforeRemove: () => Promise<void>,
+  ): Promise<void> {
+    if (!UUID_PATTERN.test(deploymentId)) throw new AppError(422, 'Invalid deployment ID for container cleanup');
+    const expectedId = containerId === null ? null : parseContainerId(containerId);
+    const options = { all: true as const, filters: { label: ['deployflow.deployment-id=' + deploymentId] } };
+    const found = await dockerDeadline((deadline) => this.#docker.listContainers({ ...options, ...deadline }));
+    const references = new Set(found.map(({ Id }) => Id));
+    if (expectedId !== null) references.add(expectedId);
+    for (const reference of references) {
+      if (!/^[a-f0-9]{64}$/.test(reference)) throw new AppError(422, 'Docker returned an invalid container ID');
+      const details = await this.#inspectContainerForCleanup(reference);
+      if (details === null) continue;
+      assertDeploymentContainerOwnership(details, reference, deploymentId);
+      await beforeRemove();
+      try {
+        await dockerDeadline((deadline) => this.#docker.getContainer(reference).remove({ ...deadline, force: true }));
+      } catch (error) {
+        const failure = toOperationError(error, 'Unable to remove the deployment container');
+        if (failure.statusCode !== 404) throw failure;
+      }
+      if (await this.#inspectContainerForCleanup(reference) !== null) {
+        throw new AppError(503, 'Docker has not confirmed removal of the deployment container');
+      }
+    }
+    if ((await dockerDeadline((deadline) => this.#docker.listContainers({ ...options, ...deadline }))).length !== 0) {
+      throw new AppError(503, 'Docker still reports a container owned by the deployment');
+    }
+  }
+
+  async #inspectContainerForCleanup(reference: string): Promise<ContainerInspectResult | null> {
+    try {
+      return await dockerDeadline((options) => this.#docker.getContainer(reference).inspect(options));
+    } catch (error) {
+      const failure = toOperationError(error, 'Unable to verify the deployment container state');
+      if (failure.statusCode !== 404) throw failure;
+      return null;
+    }
+  }
+
+  public async inventoryPublicStartup(): Promise<{ containerId: string; deploymentId: string; hostAddress: string }[]> {
+    const result: { containerId: string; deploymentId: string; hostAddress: string }[] = [];
+    const containers = await dockerDeadline((options) => this.#docker.listContainers({ all: true, ...options }));
+    for (const { Id } of containers) {
+      if (!/^[a-f0-9]{64}$/.test(Id)) throw new AppError(503, 'Docker returned an invalid inventory ID');
+      const details = await dockerDeadline((options) => this.#docker.getContainer(Id).inspect(options));
+      if (details.Id !== Id) throw new AppError(503, 'Docker inventory changed during startup');
+      const status = details.State?.Status;
+      const restart = details.HostConfig?.RestartPolicy?.Name;
+      if ((status === 'created' || status === 'exited') && (restart === 'no' || restart === '')) continue;
+      assertLinuxWorkloadLimits(details);
+      const deploymentId = details.Config?.Labels?.['deployflow.deployment-id'];
+      const bindings = Object.values(details.HostConfig?.PortBindings ?? {});
+      const binding = bindings[0];
+      if (typeof deploymentId !== 'string' || !UUID_PATTERN.test(deploymentId) ||
+        bindings.length !== 1 || !Array.isArray(binding) || binding.length !== 1 || !isRecord(binding[0]) ||
+        typeof binding[0].HostIp !== 'string') {
+        throw new AppError(503, 'Docker inventory contains an unmanaged or incompletely verified workload');
+      }
+      assertAddress(binding, binding[0].HostIp);
+      result.push({ containerId: Id, deploymentId, hostAddress: binding[0].HostIp });
+    }
+    return result;
   }
 
   public async inspectStatus(
@@ -423,14 +557,24 @@ export class ContainerService {
     const container = this.#getContainer(rawContainerId);
 
     try {
-      return readRuntimeStatus(await container.inspect(), container.id);
+      return readRuntimeStatus(await dockerDeadline((options) => container.inspect(options)), container.id);
     } catch (error: unknown) {
       throw toOperationError(error, 'Unable to inspect container status');
     }
   }
 
+  public async inspectOwnedDeploymentContainer(rawContainerId: string, deploymentId: string): Promise<ContainerRuntimeStatus | null> {
+    if (!FULL_CONTAINER_ID_PATTERN.test(rawContainerId)) throw new AppError(400, 'Shutdown requires a full Docker container ID');
+    if (!UUID_PATTERN.test(deploymentId)) throw new AppError(400, 'Deployment ID must be a valid UUID');
+    const containerId = rawContainerId.toLowerCase();
+    const details = await this.#inspectContainerForCleanup(containerId);
+    if (details === null) return null;
+    assertDeploymentContainerOwnership(details, containerId, deploymentId.toLowerCase());
+    return readRuntimeStatus(details, containerId);
+  }
+
   public async inspectLoopbackRoutingPort(input: RoutingContainer): Promise<number> {
-    if (!/^[a-f0-9]{64}$/i.test(input.containerId)) {
+    if (!FULL_CONTAINER_ID_PATTERN.test(input.containerId)) {
       throw new AppError(400, 'Routing requires a full Docker container ID');
     }
     if (!UUID_PATTERN.test(input.deploymentId)) {
@@ -446,7 +590,7 @@ export class ContainerService {
         : /^\/[^/]/.test(socket));
       if (!local) throw new AppError(422, 'Routing requires a local Docker socket or named pipe');
 
-      const details = await this.#docker.getContainer(containerId).inspect();
+      const details = await dockerDeadline((options) => this.#docker.getContainer(containerId).inspect(options));
       if (this.linuxHosting) assertLinuxWorkloadLimits(details);
       if (
         details.Id !== containerId ||
@@ -456,15 +600,7 @@ export class ContainerService {
       ) {
         throw new AppError(422, 'Docker did not verify the running deployment container');
       }
-      const bindings = details.NetworkSettings?.Ports?.[`${String(containerPort)}/tcp`];
-      if (
-        !Array.isArray(bindings) ||
-        bindings.length !== 1 ||
-        !isRecord(bindings[0]) ||
-        bindings[0].HostIp !== '127.0.0.1'
-      ) {
-        throw new AppError(422, 'Routing requires exactly one IPv4 loopback binding');
-      }
+      assertPublishedAddress(details, containerPort, input.hostAddress ?? '127.0.0.1');
       return readHostPort(details, containerPort);
     } catch (error: unknown) {
       throw toOperationError(error, 'Unable to verify Docker routing binding');
@@ -479,13 +615,13 @@ export class ContainerService {
     const tail = parseTail(options.tail);
 
     try {
-      const logs = await container.logs({
+      const logs = await dockerDeadline(() => container.logs({
         stdout: true,
         stderr: true,
         follow: false,
         timestamps: options.timestamps ?? false,
         tail,
-      });
+      }));
       return limitLogResponse(decodeDockerLogs(logs));
     } catch (error: unknown) {
       throw toOperationError(error, 'Unable to retrieve container logs');
@@ -558,7 +694,7 @@ export class ContainerService {
     const container = this.#getContainer(rawContainerId);
 
     try {
-      const details = await container.inspect();
+      const details = await dockerDeadline((options) => container.inspect(options));
       const startedAt = parseDockerDate(details.State?.StartedAt);
 
       if (startedAt === null) return { startedAt: null, uptimeSeconds: 0 };
@@ -588,7 +724,7 @@ export class ContainerService {
     const container = this.#getContainer(rawContainerId);
 
     try {
-      const statistics = await container.stats({ stream: false });
+      const statistics = await dockerDeadline(() => container.stats({ stream: false }));
 
       if (!isRecord(statistics)) {
         throw new AppError(500, 'Docker returned invalid container statistics');
@@ -602,7 +738,7 @@ export class ContainerService {
 
   async #cleanupFailedContainer(container: DockerContainer): Promise<void> {
     try {
-      await container.remove({ force: true });
+      await dockerDeadline((options) => container.remove({ ...options, force: true }));
     } catch {
       // Preserve the startup failure if Docker cannot remove the partial container.
     }

@@ -1,10 +1,13 @@
 import { Router } from 'express';
 
 import {
+  approveRevision,
   create,
+  getApproval,
   getById,
   list,
   remove,
+  revokeApproval,
   updateHealthCheck,
 } from '../controllers/project.controller.js';
 import {
@@ -19,6 +22,9 @@ export const projectRouter = Router();
 projectRouter.use(authenticate);
 projectRouter.post('/', create);
 projectRouter.get('/', list);
+projectRouter.get('/:id/public-approval', getApproval);
+projectRouter.put('/:id/public-approval', approveRevision);
+projectRouter.delete('/:id/public-approval', revokeApproval);
 projectRouter.post('/:id/deploy', deployProject);
 projectRouter.get('/:id/deployments', listProjectDeployments);
 projectRouter.get('/:id/webhook', getGitHubWebhookConfiguration);

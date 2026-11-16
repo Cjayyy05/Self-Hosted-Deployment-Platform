@@ -216,12 +216,13 @@ export default function ProjectDetailsPage() {
     latestDeployment !== null && isDeploymentInProgress(latestDeployment.status);
   const actionsBusy =
     pendingAction !== null || pendingRollbackId !== null || deploymentBusy;
+  const publicHosting = project?.publicHostingEnabled === true;
   const actionAvailability = {
-    deploy: latestDeployment === null && !actionsBusy,
+    deploy: !publicHosting && latestDeployment === null && !actionsBusy,
     stop: runningDeployment?.status === "RUNNING" && runningDeployment.containerId !== null && !actionsBusy,
-    restart: restartTarget?.containerId != null &&
+    restart: restartTarget?.containerId != null && (!publicHosting || restartTarget.publicAddressIndex != null) &&
       (restartTarget.status === "RUNNING" || restartTarget.status === "STOPPED") && !actionsBusy,
-    redeploy: latestDeployment !== null && !actionsBusy,
+    redeploy: !publicHosting && latestDeployment !== null && !actionsBusy,
   };
 
   const runAction = async (action: DeploymentAction) => {
@@ -439,6 +440,12 @@ export default function ProjectDetailsPage() {
               </div>
             </div>
 
+            {publicHosting && (
+              <p className="mt-3 text-sm text-slate-600">
+                Use the private API with an approved Git SHA to deploy or redeploy this project.
+              </p>
+            )}
+
             {deploymentBusy ? (
               <div
                 className="mt-6 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800"
@@ -492,7 +499,9 @@ export default function ProjectDetailsPage() {
                       </>
                     )}
                   </div>
-                  {project.hostingStatus === "DISABLED" && runningDeployment?.hostPort != null ? (
+                  {project.hostingStatus === "DISABLED" &&
+                  runningDeployment?.hostPort != null &&
+                  runningDeployment.publicAddressIndex == null ? (
                     <a
                       className="button-secondary"
                       href={`http://localhost:${runningDeployment.hostPort}`}

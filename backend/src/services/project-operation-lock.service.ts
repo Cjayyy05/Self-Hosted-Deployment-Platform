@@ -26,7 +26,7 @@ export type ProjectOperationLock = {
 
 export type ProjectOperationLease = {
   token: string;
-  assertValid: () => Promise<void>;
+  assertValid: (db?: ProjectOperationLockDatabase) => Promise<void>;
 };
 
 type ProjectOperationLockDependencies = {
@@ -95,8 +95,8 @@ export class ProjectOperationLockService implements ProjectOperationLock {
     try {
       return await operation({
         token,
-        assertValid: async () => {
-          if (!await this.#renew(projectId, token)) {
+        assertValid: async (db) => {
+          if (!await this.#renew(projectId, token, db)) {
             throw new AppError(409, 'Project operation lease could not be verified');
           }
         },
@@ -133,11 +133,11 @@ export class ProjectOperationLockService implements ProjectOperationLock {
     }
   }
 
-  async #renew(projectId: string, token: string): Promise<boolean> {
+  async #renew(projectId: string, token: string, db = this.#database): Promise<boolean> {
     const now = this.#now();
 
     try {
-      const result = await this.#database.project.updateMany({
+      const result = await db.project.updateMany({
         where: { id: projectId, operationLockToken: token, operationLockExpiresAt: { gt: now } },
         data: {
           operationLockExpiresAt: new Date(

@@ -34,6 +34,7 @@ describe('public hosting configuration', () => {
     hostnameSuffix: 'apps.example.net',
     adminSocketPath: '/run/deployflow-caddy/admin.sock',
     publicProjectId: '11111111-1111-4111-8111-111111111111',
+    publicOperatorId: '22222222-2222-4222-8222-222222222222',
     publicRepositoryUrl: 'https://github.com/example/app.git',
     publicBranch: 'demo/v1',
     publicCommits: 'a'.repeat(40) + ',' + 'b'.repeat(40),
@@ -52,6 +53,8 @@ describe('public hosting configuration', () => {
     for (const override of [
       { publicCommits: undefined },
       { publicCommits: 'abc' },
+      { publicOperatorId: undefined },
+      { publicOperatorId: 'operator@example.net' },
       { adminSocketPath: undefined },
       { publicBranch: '-main' },
       { publicRepositoryUrl: 'https://example.com/example/app' },
@@ -60,6 +63,14 @@ describe('public hosting configuration', () => {
       expect(() => parseHostingConfig({ ...config, ...override }, 'linux')).toThrow();
     }
     expect(() => parseHostingConfig(config, 'win32')).toThrow();
+  });
+
+  it('enables public protections with no approved project or legacy source', () => {
+    const { origin, hostnameSuffix, adminSocketPath, publicOperatorId } = config;
+    const hosting = parseHostingConfig({ origin, hostnameSuffix, adminSocketPath, publicOperatorId,
+      publicHostingEnabled: true }, 'linux');
+    expect(hosting.publicHosting).toEqual({ operatorId: publicOperatorId });
+    expect(hosting.publicApp).toBeUndefined();
   });
 });
 

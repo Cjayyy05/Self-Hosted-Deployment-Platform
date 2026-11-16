@@ -8,11 +8,30 @@ import {
   updateProjectHealthCheck,
 } from '../services/project.service.js';
 import { getAuthenticatedUserId } from '../utils/auth-request.js';
+import { approveProjectRevision, getProjectApproval, revokeProjectApproval } from '../services/project-approval.service.js';
 import {
+  parseApprovalInput,
   parseProjectId,
   parseProjectHealthCheckInput,
   parseProjectInput,
 } from '../utils/project-validation.js';
+
+export const getApproval: RequestHandler = async (request, response) => {
+  const approval = await getProjectApproval(getAuthenticatedUserId(request), parseProjectId(request.params.id));
+  response.json({ approval });
+};
+
+export const approveRevision: RequestHandler = async (request, response) => {
+  const approval = await approveProjectRevision(
+    getAuthenticatedUserId(request), parseProjectId(request.params.id), parseApprovalInput(request.body),
+  );
+  response.json({ approval });
+};
+
+export const revokeApproval: RequestHandler = async (request, response) => {
+  const approval = await revokeProjectApproval(getAuthenticatedUserId(request), parseProjectId(request.params.id));
+  response.status(approval.status === 'WITHDRAWAL_PENDING' ? 202 : 200).json({ approval });
+};
 
 export const create: RequestHandler = async (request, response) => {
   const userId = getAuthenticatedUserId(request);

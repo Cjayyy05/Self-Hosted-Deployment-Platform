@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 
 import { database } from '../config/database.js';
-import { env } from '../config/env.js';
+import { buildNetworkService } from './build-network.service.js';
+import { env, managesProjectRoute } from '../config/env.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import { AppError } from '../utils/app-error.js';
 import { projectHostnameLabel } from '../utils/project-hostname.js';
@@ -10,6 +11,8 @@ import { deploymentRoutingService, requireRoutingLease } from './deployment-rout
 import { dockerBuildService } from './docker-build.service.js';
 import { projectHostingService } from './project-hosting.service.js';
 import { projectOperationLockService } from './project-operation-lock.service.js';
+import { assertPublicOperator } from './public-application-policy.js';
+import { assertNoPendingPublicWithdrawal } from './public-hosting-safety.service.js';
 
 type CreateProjectData = {
   name: string;
@@ -35,7 +38,7 @@ const projectSelect = {
 const deploymentSummary = { id: true, status: true, commitHash: true, createdAt: true } as const;
 const projectHostingSelect = {
   ...projectSelect,
-  activeDeployment: { select: { ...deploymentSummary, hostPort: true } },
+  activeDeployment: { select: { ...deploymentSummary, hostPort: true, publicAddressIndex: true } },
   routingOperation: true,
   deployments: {
     select: deploymentSummary,
@@ -52,6 +55,7 @@ const withHosting = async (project: Prisma.ProjectGetPayload<{ select: typeof pr
   return {
     ...fields,
     ...hosting,
+    ...(env.hosting.publicHosting === undefined ? {} : { publicHostingEnabled: true as const }),
     activeDeployment: activeDeployment === null ? null : {
       id: activeDeployment.id,
       status: activeDeployment.status,
@@ -66,9 +70,7 @@ export const createProject = async (
   userId: string,
   data: CreateProjectData,
 ) => {
-  if (env.hosting.publicApp !== undefined) {
-    throw new AppError(403, 'Create the approved project privately before enabling public hosting');
-  }
+  assertPublicOperator(userId);
   const id = randomUUID();
   const project = await database.project.create({
     data: { ...data, id, hostnameLabel: projectHostnameLabel(id), userId },
@@ -127,61 +129,64 @@ const deleteProjectDockerResources = async (
   assertSafe: () => Promise<void>,
 ): Promise<void> => {
   const deployments = await database.deployment.findMany({
-      where: { projectId },
-      select: {
-        containerId: true,
-        imageTag: true,
-      },
+    where: { projectId }, select: { id: true, containerId: true, imageTag: true },
   });
 
+  try {
+    if (env.hosting.publicHosting === undefined) {
+      await deletePrivateProjectContainers(deployments, activeContainerId, assertSafe);
+    } else {
+      const active = deployments.find(({ containerId }) => containerId !== null && containerId === activeContainerId);
+      if (activeContainerId !== null && active === undefined) throw new Error('Missing active deployment for cleanup');
+      for (const deployment of deployments) {
+        if (deployment !== active) {
+          await containerService.removeDeploymentContainers(deployment.id, deployment.containerId, assertSafe);
+        }
+      }
+      if (active !== undefined) {
+        await containerService.removeDeploymentContainers(active.id, active.containerId, assertSafe);
+      }
+    }
+    const imageTags = new Set(deployments.flatMap(({ imageTag }) => imageTag === null ? [] : [imageTag]));
+    for (const imageTag of imageTags) {
+      if (await dockerBuildService.imageExists(imageTag)) {
+        await assertSafe();
+        await dockerBuildService.removeImage(imageTag);
+      }
+    }
+  } catch {
+    throw new AppError(502, 'Project Docker resources could not be cleaned up; the project was not deleted');
+  }
+};
+
+const deletePrivateProjectContainers = async (
+  deployments: readonly { containerId: string | null }[],
+  activeContainerId: string | null,
+  assertSafe: () => Promise<void>,
+): Promise<void> => {
   const containerIds = new Set(
-      deployments.flatMap(({ containerId }) =>
-        containerId === null ? [] : [containerId],
-      ),
+    deployments.flatMap(({ containerId }) => containerId === null ? [] : [containerId]),
   );
   if (activeContainerId !== null) {
     containerIds.delete(activeContainerId);
     containerIds.add(activeContainerId);
   }
 
+  for (const containerId of containerIds) {
+    let status;
     try {
-      for (const containerId of containerIds) {
-        let status;
-
-        try {
-          status = await containerService.inspectStatus(containerId);
-        } catch (error: unknown) {
-          if (error instanceof AppError && error.statusCode === 404) continue;
-          throw error;
-        }
-
-        if (status.running) {
-          await assertSafe();
-          await containerService.stopContainer(containerId);
-        }
-        await assertSafe();
-        await containerService.removeContainer(containerId);
-      }
-
-      const imageTags = new Set(
-        deployments.flatMap(({ imageTag }) =>
-          imageTag === null ? [] : [imageTag],
-        ),
-      );
-
-      for (const imageTag of imageTags) {
-        if (await dockerBuildService.imageExists(imageTag)) {
-          await assertSafe();
-          await dockerBuildService.removeImage(imageTag);
-        }
-      }
-    } catch {
-      throw new AppError(
-        502,
-        'Project Docker resources could not be cleaned up; the project was not deleted',
-      );
+      status = await containerService.inspectStatus(containerId);
+    } catch (error: unknown) {
+      if (error instanceof AppError && error.statusCode === 404) continue;
+      throw error;
     }
-
+    if (status.running) {
+      await assertSafe();
+      await containerService.stopContainer(containerId);
+    }
+    await assertSafe();
+    await containerService.removeContainer(containerId);
+  }
 };
 
 export const deleteProject = async (
@@ -192,22 +197,29 @@ export const deleteProject = async (
   if (owned === null) throw new AppError(404, 'Project not found');
 
   await projectOperationLockService.runExclusive(projectId, async (lease) => {
-    const routing = deploymentRoutingService;
+    const publicLease = env.hosting.publicHosting === undefined ? undefined : requireRoutingLease(lease);
+    if (publicLease !== undefined) await assertNoPendingPublicWithdrawal(projectId);
+    const routing = managesProjectRoute(env.hosting, projectId) ? deploymentRoutingService : undefined;
     const hosted = routing === undefined ? undefined : requireRoutingLease(lease);
     const deletion = routing === undefined || hosted === undefined
       ? null
       : await routing.beginDelete(projectId, hosted);
     const assertSafe = async () => {
       if (routing !== undefined && hosted !== undefined) await routing.assertWithdrawn(projectId, hosted);
+      else await publicLease?.assertValid();
     };
     try {
+      if (publicLease !== undefined) await buildNetworkService.closeProject(projectId);
       await deleteProjectDockerResources(projectId, deletion?.containerId ?? null, assertSafe);
       await assertSafe();
+      const held = hosted ?? publicLease;
       const result = await database.project.deleteMany({
         where: {
           id: projectId, userId,
-          ...(hosted === undefined || deletion === null ? {} : {
-            operationLockToken: hosted.token, operationLockExpiresAt: { gt: new Date() },
+          ...(held === undefined ? {} : {
+            operationLockToken: held.token, operationLockExpiresAt: { gt: new Date() },
+          }),
+          ...(deletion === null ? {} : {
             activeDeploymentId: deletion.deploymentId,
             routingDeploymentId: deletion.deploymentId,
             routingOperation: deletion.deploymentId === null ? null : 'DELETE',

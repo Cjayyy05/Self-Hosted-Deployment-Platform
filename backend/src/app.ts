@@ -1,4 +1,5 @@
 import express from 'express';
+import { env } from './config/env.js';
 
 import { errorHandler } from './middleware/error-handler.js';
 import { notFound } from './middleware/not-found.js';
@@ -12,11 +13,13 @@ export const createApp = (): express.Express => {
   const app = express();
 
   app.disable('x-powered-by');
-  app.use(
-    '/api/webhooks/github',
-    express.raw({ type: 'application/json', limit: '1mb' }),
-    githubWebhookRouter,
-  );
+  if (env.hosting.publicHosting === undefined) {
+    app.use(
+      '/api/webhooks/github',
+      express.raw({ type: 'application/json', limit: '1mb' }),
+      githubWebhookRouter,
+    );
+  }
   app.use(express.json());
 
   app.use('/api/health', healthRouter);

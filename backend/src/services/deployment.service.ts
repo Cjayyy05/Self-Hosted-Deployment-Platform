@@ -1,11 +1,14 @@
 import { database } from '../config/database.js';
-import { env } from '../config/env.js';
+import { env, managesProjectRoute, type HostingConfig } from '../config/env.js';
 import {
   DeploymentStatus,
   type DeploymentStatus as DeploymentStatusValue,
 } from '../generated/prisma/enums.js';
 import { AppError } from '../utils/app-error.js';
-import { assertApprovedCommit, assertApprovedSource } from './public-application-policy.js';
+import { MAX_WORKLOAD_ADDRESS, workloadAddress } from '../utils/workload-address.js';
+import { buildNetworkService } from './build-network.service.js';
+import { assertPublicOperator, publicApplicationPolicy, type PublicApplicationPolicy } from './public-application-policy.js';
+import { assertNoPendingPublicWithdrawal, assertPublicWorkloadReady } from './public-hosting-safety.service.js';
 import { applicationHealthCheckService } from './application-health-check.service.js';
 import {
   applicationDetector,
@@ -15,6 +18,7 @@ import {
   dockerBuildService,
   type DockerBuildOutput,
   type DockerBuildResult,
+  type DockerBuildInput,
 } from './docker-build.service.js';
 import {
   deploymentRoutingService,
@@ -24,10 +28,12 @@ import {
 } from './deployment-routing.service.js';
 import {
   containerService,
+  ContainerLifecyclePendingError,
   type ContainerCpuStatistics,
   type ContainerMemoryStatistics,
   type ContainerUptime,
   type StartContainerResult,
+  type StartContainerInput,
 } from './container.service.js';
 import {
   gitRepositoryService,
@@ -44,6 +50,7 @@ const UUID_PATTERN =
 
 export type DeploymentProject = {
   id: string;
+  userId: string;
   repositoryUrl: string;
   branch: string;
   containerPort: number;
@@ -61,6 +68,7 @@ export type DeploymentRecord = {
   imageId: string | null;
   imageTag: string | null;
   hostPort: number | null;
+  publicAddressIndex?: number | null;
   errorMessage: string | null;
   startedAt: Date | null;
   finishedAt: Date | null;
@@ -117,11 +125,13 @@ export type DeploymentUpdateData = {
 };
 
 export type DeploymentDatabase = {
+  $transaction?: typeof database.$transaction;
   project: {
     findUnique: (options: {
       where: { id: string };
       select: {
         id: true;
+        userId: true;
         repositoryUrl: true;
         branch: true;
         containerPort: true;
@@ -132,6 +142,7 @@ export type DeploymentDatabase = {
       where: { id: string; userId: string };
       select: {
         id: true;
+        userId: true;
         repositoryUrl: true;
         branch: true;
         containerPort: true;
@@ -161,6 +172,7 @@ export type DeploymentDatabase = {
         project: {
           select: {
             id: true;
+            userId: true;
             repositoryUrl: true;
             branch: true;
             containerPort: true;
@@ -212,7 +224,9 @@ export type DeploymentServiceDependencies = {
   buildService?: DeploymentBuildService;
   containerService?: DeploymentContainerService;
   operationLock?: ProjectOperationLock;
-  routing?: Pick<DeploymentRoutingService, 'assertIdle' | 'promote' | 'stop' | 'beginRestart' | 'restartFailed'>;
+  routing?: Pick<DeploymentRoutingService, 'assertIdle' | 'assertPublicPortOwned' | 'promote' | 'stop' | 'beginRestart' | 'restartFailed'>;
+  hosting?: HostingConfig;
+  policy?: Pick<PublicApplicationPolicy, 'selectCommit' | 'assertApproved'>;
   now?: () => Date;
 };
 
@@ -269,6 +283,8 @@ export class DeploymentService {
   readonly #containerService: DeploymentContainerService;
   readonly #operationLock: ProjectOperationLock;
   readonly #routing: DeploymentServiceDependencies['routing'];
+  readonly #hosting: HostingConfig;
+  readonly #policy: Pick<PublicApplicationPolicy, 'selectCommit' | 'assertApproved'>;
   readonly #now: () => Date;
 
   public constructor(dependencies: DeploymentServiceDependencies = {}) {
@@ -284,18 +300,76 @@ export class DeploymentService {
     this.#operationLock =
       dependencies.operationLock ?? projectOperationLockService;
     this.#routing = dependencies.routing ?? deploymentRoutingService;
+    this.#hosting = dependencies.hosting ?? env.hosting;
+    this.#policy = dependencies.policy ?? publicApplicationPolicy;
     this.#now = dependencies.now ?? (() => new Date());
+  }
+
+  #projectRouting(projectId: string) {
+    return managesProjectRoute(this.#hosting, projectId) ? this.#routing : undefined;
+  }
+
+  #workloadLease(projectId: string, lease: ProjectOperationLease | undefined) {
+    return this.#hosting.publicHosting !== undefined || this.#projectRouting(projectId) !== undefined
+      ? requireRoutingLease(lease) : undefined;
+  }
+
+  async #assertWorkloadAllowed(project: DeploymentProject, commitHash: string | null) {
+    await this.#policy.assertApproved(project, commitHash);
+    if (this.#hosting.publicHosting !== undefined) await assertPublicWorkloadReady(project.id);
+  }
+
+  async #startWorkload(input: StartContainerInput, project: DeploymentProject, commitHash: string, lease?: ProjectOperationLease) {
+    if (this.#hosting.publicHosting === undefined) return this.#containerService.startContainer(input);
+    const held = requireRoutingLease(lease);
+    if (this.#database.$transaction === undefined) throw new AppError(503, 'Unable to reserve a public workload address');
+    const transaction = this.#database.$transaction.bind(this.#database);
+    const addressIndex = await transaction(async (tx) => {
+      await held.assertValid(tx);
+      const binding = await tx.publicRoutingBinding.update({
+        where: { id: 1, nextWorkloadAddress: { lt: MAX_WORKLOAD_ADDRESS } },
+        data: { nextWorkloadAddress: { increment: 1 } }, select: { nextWorkloadAddress: true },
+      });
+      const result = await tx.deployment.updateMany({
+        where: { id: input.deploymentId, projectId: project.id, status: DeploymentStatus.STARTING, publicAddressIndex: null },
+        data: { publicAddressIndex: binding.nextWorkloadAddress },
+      });
+      if (result.count !== 1) throw new AppError(409, 'Deployment address reservation is no longer current');
+      return binding.nextWorkloadAddress;
+    });
+    return this.#containerService.startContainer({ ...input, hostAddress: workloadAddress(addressIndex) }, async (containerId) => {
+      if (!/^[a-f0-9]{64}$/.test(containerId)) throw new AppError(502, 'Docker returned an invalid container ID');
+      await transaction(async (tx) => {
+        await held.assertValid(tx);
+        const result = await tx.deployment.updateMany({
+          where: { id: input.deploymentId, projectId: project.id, status: DeploymentStatus.STARTING },
+          data: { containerId },
+        });
+        if (result.count !== 1) throw new AppError(409, 'Deployment startup is no longer current');
+      });
+      await this.#projectRouting(project.id)?.assertPublicPortOwned();
+      await this.#assertWorkloadAllowed(project, commitHash);
+      await held.assertValid();
+    });
+  }
+
+  #buildWorkload(input: DockerBuildInput, lease: ProjectOperationLease | undefined, onOutput: (output: DockerBuildOutput) => void) {
+    if (this.#hosting.publicHosting === undefined) return this.#buildService.buildImage(input, onOutput);
+    return buildNetworkService.run(input.projectId, input.deploymentId, requireRoutingLease(lease),
+      (buildNetworkId, confirmTerminal, markSubmitted) =>
+        this.#buildService.buildImage({ ...input, buildNetworkId, confirmTerminal, markSubmitted }, onOutput));
   }
 
   public async deployProjectForUser(
     userId: string,
     rawProjectId: unknown,
     onEvent?: DeploymentEventCallback,
+    commitHash?: string,
   ): Promise<DeploymentRecord> {
     const projectId = parseIdentifier(rawProjectId, 'Project ID');
     await this.#getOwnedProject(userId, projectId);
     return this.#operationLock.runExclusive(projectId, (lease) =>
-      this.#deployProjectUnlocked(projectId, onEvent, lease),
+      this.#deployProjectUnlocked(projectId, onEvent, lease, commitHash),
     );
   }
 
@@ -356,13 +430,16 @@ export class DeploymentService {
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
-    assertApprovedSource(env.hosting.publicApp, { ...deployment.project, id: deployment.projectId });
-    assertApprovedCommit(env.hosting.publicApp, deployment.commitHash);
+    const routing = this.#projectRouting(deployment.projectId);
+    const hostingLease = this.#workloadLease(deployment.projectId, lease);
+    await this.#assertWorkloadAllowed(deployment.project, deployment.commitHash);
+    if (this.#hosting.publicHosting !== undefined && deployment.publicAddressIndex == null) {
+      throw new AppError(409, 'Deploy an approved revision to replace this legacy container');
+    }
     const containerId = this.#requireContainerId(deployment);
     let containerRestarted = false;
-    const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
     const shouldRoute = hostingLease !== undefined &&
-      await this.#routing?.beginRestart(deployment.projectId, deployment.id, hostingLease);
+      await routing?.beginRestart(deployment.projectId, deployment.id, hostingLease);
 
     try {
       await hostingLease?.assertValid();
@@ -374,9 +451,13 @@ export class DeploymentService {
         deploymentId: deployment.id,
         status: DeploymentStatus.STARTING,
       });
+      if (this.#hosting.publicHosting !== undefined) await routing?.assertPublicPortOwned();
+      await this.#assertWorkloadAllowed(deployment.project, deployment.commitHash);
+      await hostingLease?.assertValid();
       const restartedContainer = await this.#containerService.restartContainer(
         containerId,
         deployment.project.containerPort,
+        ...(deployment.publicAddressIndex == null ? [] as const : [workloadAddress(deployment.publicAddressIndex)] as const),
       );
       containerRestarted = true;
       await hostingLease?.assertValid();
@@ -397,10 +478,12 @@ export class DeploymentService {
       await this.#healthCheckService.waitUntilHealthy({
         hostPort: restartedContainer.hostPort,
         path: deployment.project.healthCheckPath,
+        ...(restartedContainer.hostAddress === undefined ? {} : { hostAddress: restartedContainer.hostAddress }),
       });
+      await this.#policy.assertApproved(deployment.project, deployment.commitHash);
       await hostingLease?.assertValid();
-      const runningDeployment = shouldRoute && this.#routing !== undefined
-        ? await this.#routing.promote(
+      const runningDeployment = shouldRoute && routing !== undefined
+        ? await routing.promote(
           { ...deployment, hostPort: restartedContainer.hostPort },
           this.#now(),
           requireRoutingLease(hostingLease),
@@ -420,8 +503,12 @@ export class DeploymentService {
       return runningDeployment;
     } catch (error: unknown) {
       if (error instanceof RoutingPendingError) throw error;
+      if (error instanceof ContainerLifecyclePendingError) {
+        if (shouldRoute) throw new RoutingPendingError();
+        throw error;
+      }
       const handled = hostingLease !== undefined &&
-        await this.#routing?.restartFailed(deployment.projectId, deployment.id, hostingLease);
+        await routing?.restartFailed(deployment.projectId, deployment.id, hostingLease);
       const errorMessage =
         error instanceof AppError ? error.message : 'Unable to restart deployment';
 
@@ -463,6 +550,7 @@ export class DeploymentService {
     userId: string,
     rawDeploymentId: unknown,
     onEvent?: DeploymentEventCallback,
+    commitHash?: string,
   ): Promise<DeploymentRecord> {
     const previousDeployment = await this.#getOwnedDeployment(
       userId,
@@ -475,6 +563,7 @@ export class DeploymentService {
           previousDeployment.projectId,
           onEvent,
           lease,
+          commitHash,
         ),
     );
   }
@@ -509,6 +598,7 @@ export class DeploymentService {
     rawProjectId: unknown,
     onEvent?: DeploymentEventCallback,
   ): Promise<DeploymentRecord> {
+    if (this.#hosting.publicHosting !== undefined) throw new AppError(403, 'Public deployment requires the configured operator');
     const projectId = parseIdentifier(rawProjectId, 'Project ID');
     return this.#operationLock.runExclusive(projectId, (lease) =>
       this.#deployProjectReplacingRunningUnlocked(projectId, onEvent, lease),
@@ -519,10 +609,12 @@ export class DeploymentService {
     projectId: string,
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
+    commitHash?: string,
   ): Promise<DeploymentRecord> {
-    const newDeployment = await this.#deployProjectUnlocked(projectId, onEvent, lease);
+    const newDeployment = await this.#deployProjectUnlocked(projectId, onEvent, lease, commitHash);
 
-    if (this.#routing === undefined) {
+    if (this.#projectRouting(projectId) === undefined) {
+      await this.#workloadLease(projectId, lease)?.assertValid();
       await this.#stopPreviousRunningDeployments(projectId, newDeployment.id, onEvent);
     }
 
@@ -534,19 +626,20 @@ export class DeploymentService {
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
+    if (this.#hosting.publicHosting !== undefined) await assertNoPendingPublicWithdrawal(deployment.projectId);
     const containerId = this.#requireContainerId(deployment);
+    const routing = this.#projectRouting(deployment.projectId);
+    const hostingLease = this.#workloadLease(deployment.projectId, lease);
 
     try {
-      if (this.#routing !== undefined) {
-        const hosted = await this.#routing.stop(deployment.projectId, deployment.id, requireRoutingLease(lease));
-        if (hosted !== null) {
-          this.#emit(onEvent, { type: 'status', deploymentId: hosted.id, status: DeploymentStatus.STOPPED });
-          return hosted;
-        }
-        await requireRoutingLease(lease).assertValid();
+      if (routing !== undefined) {
+        const hosted = await routing.stop(deployment.projectId, deployment.id, requireRoutingLease(lease));
+        this.#emit(onEvent, { type: 'status', deploymentId: hosted.id, status: DeploymentStatus.STOPPED });
+        return hosted;
       }
+      await hostingLease?.assertValid();
       await this.#containerService.stopContainer(containerId);
-      if (this.#routing !== undefined) await requireRoutingLease(lease).assertValid();
+      await hostingLease?.assertValid();
       const stoppedDeployment = await this.#updateDeployment(deployment.id, {
         status: DeploymentStatus.STOPPED,
         finishedAt: this.#now(),
@@ -596,6 +689,7 @@ export class DeploymentService {
     rawProjectId: unknown,
     onEvent?: DeploymentEventCallback,
   ): Promise<DeploymentRecord> {
+    if (this.#hosting.publicHosting !== undefined) throw new AppError(403, 'Public deployment requires the configured operator');
     const projectId = parseIdentifier(rawProjectId, 'Project ID');
     if (this.#routing === undefined) return this.#deployProjectUnlocked(projectId, onEvent);
     return this.#operationLock.runExclusive(projectId, (lease) => this.#deployProjectUnlocked(projectId, onEvent, lease));
@@ -605,9 +699,11 @@ export class DeploymentService {
     projectId: string,
     onEvent: DeploymentEventCallback | undefined,
     lease?: ProjectOperationLease,
+    requestedCommit?: string,
   ): Promise<DeploymentRecord> {
-    const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
-    if (hostingLease !== undefined) await this.#routing?.assertIdle(projectId, hostingLease);
+    const routing = this.#projectRouting(projectId);
+    const hostingLease = this.#workloadLease(projectId, lease);
+    if (routing !== undefined) await routing.assertIdle(projectId, requireRoutingLease(lease));
     let project: DeploymentProject | null;
 
     try {
@@ -615,6 +711,7 @@ export class DeploymentService {
         where: { id: projectId },
         select: {
           id: true,
+          userId: true,
           repositoryUrl: true,
           branch: true,
           containerPort: true,
@@ -626,7 +723,8 @@ export class DeploymentService {
     }
 
     if (project === null) throw new AppError(404, 'Project not found');
-    assertApprovedSource(env.hosting.publicApp, project);
+    const pinnedCommit = await this.#policy.selectCommit(project, requestedCommit);
+    if (this.#hosting.publicHosting !== undefined) await assertPublicWorkloadReady(projectId);
 
     let deployment: DeploymentRecord;
 
@@ -652,10 +750,13 @@ export class DeploymentService {
       stage = DeploymentStatus.CLONING;
       deployment = await this.#changeStatus(deployment.id, stage, onEvent);
       this.#emitLog(onEvent, deployment.id, 'deployment', 'Cloning repository');
-      repository = await this.#gitService.prepareRepository({
-        repositoryUrl: project.repositoryUrl,
-        branch: project.branch,
-      });
+      const source = { repositoryUrl: project.repositoryUrl, branch: project.branch };
+      repository = pinnedCommit === undefined
+        ? await this.#gitService.prepareRepository(source)
+        : await this.#gitService.prepareRepositoryAtCommit({ ...source, commitHash: pinnedCommit });
+      if (pinnedCommit !== undefined && repository.commitHash !== pinnedCommit) {
+        throw new AppError(422, 'Repository returned an unexpected commit');
+      }
       const detectedApplication = await this.#applicationDetector.prepareBuild({
         repositoryDirectory: repository.repositoryPath,
         containerPort: project.containerPort,
@@ -673,13 +774,15 @@ export class DeploymentService {
 
       stage = DeploymentStatus.BUILDING;
       deployment = await this.#changeStatus(deployment.id, stage, onEvent);
-      image = await this.#buildService.buildImage(
+      await this.#assertWorkloadAllowed(project, repository.commitHash);
+      await hostingLease?.assertValid();
+      image = await this.#buildWorkload(
         {
           repositoryDirectory: repository.repositoryPath,
           projectId,
           deploymentId: deployment.id,
         },
-        (output) => {
+        hostingLease, (output) => {
           const message = formatBuildOutput(output);
           if (message !== null) {
             this.#emitLog(onEvent, deployment.id, 'build', message);
@@ -692,13 +795,14 @@ export class DeploymentService {
       });
 
       stage = DeploymentStatus.STARTING;
-      await hostingLease?.assertValid();
       deployment = await this.#changeStatus(deployment.id, stage, onEvent);
-      startedContainer = await this.#containerService.startContainer({
+      await this.#assertWorkloadAllowed(project, repository.commitHash);
+      await hostingLease?.assertValid();
+      startedContainer = await this.#startWorkload({
         imageIdentifier: image.imageId,
         containerPort: project.containerPort,
         deploymentId: deployment.id,
-      });
+      }, project, repository.commitHash, hostingLease);
       await hostingLease?.assertValid();
       deployment = await this.#updateDeployment(deployment.id, {
         containerId: startedContainer.containerId,
@@ -716,13 +820,16 @@ export class DeploymentService {
       await this.#healthCheckService.waitUntilHealthy({
         hostPort: startedContainer.hostPort,
         path: project.healthCheckPath,
+        ...(startedContainer.hostAddress === undefined ? {} : { hostAddress: startedContainer.hostAddress }),
       });
 
-      if (this.#routing !== undefined) {
+      if (routing !== undefined) {
         await this.#gitService.cleanup(repository.repositoryPath);
         repository = undefined;
-        deployment = await this.#routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
+        deployment = await routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
       } else {
+        await this.#policy.assertApproved(project, deployment.commitHash);
+        await hostingLease?.assertValid();
         stage = DeploymentStatus.RUNNING;
         deployment = await this.#updateDeployment(deployment.id, {
           status: stage, startedAt: this.#now(), finishedAt: null, errorMessage: null,
@@ -778,10 +885,11 @@ export class DeploymentService {
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
-    assertApprovedSource(env.hosting.publicApp, { ...sourceDeployment.project, id: sourceDeployment.projectId });
-    assertApprovedCommit(env.hosting.publicApp, sourceDeployment.commitHash);
-    const hostingLease = this.#routing === undefined ? undefined : requireRoutingLease(lease);
-    if (hostingLease !== undefined) await this.#routing?.assertIdle(sourceDeployment.projectId, hostingLease);
+    const project = sourceDeployment.project;
+    const routing = this.#projectRouting(sourceDeployment.projectId);
+    const hostingLease = this.#workloadLease(sourceDeployment.projectId, lease);
+    await this.#assertWorkloadAllowed(project, sourceDeployment.commitHash);
+    if (routing !== undefined) await routing.assertIdle(sourceDeployment.projectId, requireRoutingLease(lease));
     const commitHash = sourceDeployment.commitHash;
 
     if (commitHash === null) {
@@ -822,8 +930,10 @@ export class DeploymentService {
     try {
       deployment = await this.#updateDeployment(deployment.id, { commitHash });
 
-      const reusableImageIdentifier =
-        sourceDeployment.imageId ?? sourceDeployment.imageTag;
+      const reusableImageIdentifier = this.#hosting.publicHosting === undefined
+        ? sourceDeployment.imageId ?? sourceDeployment.imageTag
+        : sourceDeployment.imageId !== null && /^sha256:[a-f0-9]{64}$/.test(sourceDeployment.imageId)
+          ? sourceDeployment.imageId : null;
       const canReuseImage =
         reusableImageIdentifier !== null &&
         (await this.#buildService.imageExists(reusableImageIdentifier));
@@ -865,6 +975,7 @@ export class DeploymentService {
           branch: sourceDeployment.project.branch,
           commitHash,
         });
+        if (repository.commitHash !== commitHash) throw new AppError(422, 'Repository returned an unexpected commit');
         const detectedApplication = await this.#applicationDetector.prepareBuild({
           repositoryDirectory: repository.repositoryPath,
           containerPort: sourceDeployment.project.containerPort,
@@ -875,13 +986,15 @@ export class DeploymentService {
 
         stage = DeploymentStatus.BUILDING;
         deployment = await this.#changeStatus(deployment.id, stage, onEvent);
-        builtImage = await this.#buildService.buildImage(
+        await this.#assertWorkloadAllowed(project, commitHash);
+        await hostingLease?.assertValid();
+        builtImage = await this.#buildWorkload(
           {
             repositoryDirectory: repository.repositoryPath,
             projectId: sourceDeployment.projectId,
             deploymentId: deployment.id,
           },
-          (output) => {
+          hostingLease, (output) => {
             const message = formatBuildOutput(output);
             if (message !== null) {
               this.#emitLog(onEvent, deployment.id, 'build', message);
@@ -896,13 +1009,14 @@ export class DeploymentService {
       }
 
       stage = DeploymentStatus.STARTING;
-      await hostingLease?.assertValid();
       deployment = await this.#changeStatus(deployment.id, stage, onEvent);
-      startedContainer = await this.#containerService.startContainer({
+      await this.#assertWorkloadAllowed(project, commitHash);
+      await hostingLease?.assertValid();
+      startedContainer = await this.#startWorkload({
         imageIdentifier,
         containerPort: sourceDeployment.project.containerPort,
         deploymentId: deployment.id,
-      });
+      }, project, commitHash, hostingLease);
       await hostingLease?.assertValid();
       deployment = await this.#updateDeployment(deployment.id, {
         containerId: startedContainer.containerId,
@@ -920,15 +1034,18 @@ export class DeploymentService {
       await this.#healthCheckService.waitUntilHealthy({
         hostPort: startedContainer.hostPort,
         path: sourceDeployment.project.healthCheckPath,
+        ...(startedContainer.hostAddress === undefined ? {} : { hostAddress: startedContainer.hostAddress }),
       });
 
-      if (this.#routing !== undefined) {
+      if (routing !== undefined) {
         if (repository !== undefined) {
           await this.#gitService.cleanup(repository.repositoryPath);
           repository = undefined;
         }
-        deployment = await this.#routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
+        deployment = await routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
       } else {
+        await this.#policy.assertApproved(project, commitHash);
+        await hostingLease?.assertValid();
         stage = DeploymentStatus.RUNNING;
         deployment = await this.#updateDeployment(deployment.id, {
           status: stage, startedAt: this.#now(), finishedAt: null, errorMessage: null,
@@ -980,7 +1097,8 @@ export class DeploymentService {
       throw new AppError(statusCode, errorMessage);
     }
 
-    if (this.#routing === undefined) {
+    if (routing === undefined) {
+      await hostingLease?.assertValid();
       await this.#stopPreviousRunningDeployments(sourceDeployment.projectId, deployment.id, onEvent);
     }
 
@@ -1012,10 +1130,12 @@ export class DeploymentService {
     userId: string,
     projectId: string,
   ): Promise<DeploymentProject> {
+    assertPublicOperator(userId, this.#hosting);
     const project = await this.#database.project.findFirst({
       where: { id: projectId, userId },
       select: {
         id: true,
+        userId: true,
         repositoryUrl: true,
         branch: true,
         containerPort: true,
@@ -1031,12 +1151,14 @@ export class DeploymentService {
     userId: string,
     deploymentId: string,
   ): Promise<OwnedDeployment> {
+    assertPublicOperator(userId, this.#hosting);
     const deployment = await this.#database.deployment.findFirst({
       where: { id: deploymentId, project: { userId } },
       include: {
         project: {
           select: {
             id: true,
+            userId: true,
             repositoryUrl: true,
             branch: true,
             containerPort: true,

@@ -13,6 +13,7 @@ export type Project = {
   localApplicationUrl: string | null;
   publicApplicationUrl?: string;
   publicProbePath?: string;
+  publicHostingEnabled?: true;
   hostingStatus: HostingStatus;
   activeDeployment: DeploymentSummary | null;
   latestDeployment: DeploymentSummary | null;
@@ -65,6 +66,7 @@ export type Deployment = {
   imageId: string | null;
   imageTag: string | null;
   hostPort: number | null;
+  publicAddressIndex?: number | null;
   errorMessage: string | null;
   startedAt: string | null;
   finishedAt: string | null;

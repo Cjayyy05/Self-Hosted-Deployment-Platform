@@ -27,5 +27,7 @@ export const projectRouteProbe = (url: URL, path: string) => ({
 
 export const PUBLIC_PROBE_PREFIX = '/.well-known/deployflow-health/';
 
-export const publicProbePath = (hostname: string, upstreamPort: number, healthPath: string): string =>
-  PUBLIC_PROBE_PREFIX + createHash('sha256').update(JSON.stringify([hostname, upstreamPort, healthPath])).digest('hex');
+export type RouteTarget = { address: string; port: number };
+
+export const publicProbePath = (hostname: string, target: RouteTarget, healthPath: string): string =>
+  PUBLIC_PROBE_PREFIX + createHash('sha256').update(JSON.stringify([hostname, target.address, target.port, healthPath])).digest('hex');

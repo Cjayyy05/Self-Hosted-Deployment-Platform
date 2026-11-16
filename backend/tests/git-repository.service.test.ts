@@ -1,5 +1,8 @@
-import { access, writeFile } from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { access, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -28,27 +31,53 @@ describe('GitRepositoryService', () => {
     runGit = vi.fn<GitCommandRunner>();
   });
 
-  it('rejects an unapproved source before Git and removes a clone of an unreviewed branch tip', async () => {
-    const approved = {
-      projectId: '11111111-1111-4111-8111-111111111111',
-      repositoryUrl,
-      branch: 'main',
-      commits: new Set([commitHash]),
-    };
-    const service = new GitRepositoryService({ runGit }, approved);
-    await expect(service.prepareRepository({ repositoryUrl, branch: 'other' })).rejects.toMatchObject({ statusCode: 403 });
-    await expect(service.prepareRepositoryAtCommit({ repositoryUrl, branch: 'main', commitHash: 'f'.repeat(40) }))
-      .rejects.toMatchObject({ statusCode: 403 });
-    expect(runGit).not.toHaveBeenCalled();
-    let clone: string | undefined;
+  it('rejects checkout when HEAD differs from the requested SHA and cleans up', async () => {
+    const service = new GitRepositoryService({ runGit });
+    let checkout: string | undefined;
     runGit.mockImplementation((args) => {
-      if (args[0] === 'clone') clone = args.at(-1);
+      if (args[0] === 'init') checkout = args.at(-1);
       return Promise.resolve('f'.repeat(40));
     });
-    await expect(service.prepareRepository({ repositoryUrl, branch: 'main' })).rejects.toMatchObject({ statusCode: 403 });
-    expect(clone).toBeDefined();
-    expect(await pathExists(clone ?? '')).toBe(false);
+    await expect(service.prepareRepositoryAtCommit({ repositoryUrl, branch: 'main', commitHash }))
+      .rejects.toMatchObject({ statusCode: 422, message: 'Repository returned an unexpected commit' });
+    expect(checkout).toBeDefined();
+    expect(await pathExists(checkout ?? '')).toBe(false);
   });
+
+  it('retrieves an independently reviewed exact SHA after the configured branch has moved', async () => {
+    const source = await mkdtemp(join(tmpdir(), 'deployflow-reviewed-git-'));
+    const exec = promisify(execFile);
+    const git = async (...args: string[]) => (await exec('git', ['-c', 'core.autocrlf=false', ...args], {
+      windowsHide: true, timeout: 8000, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    })).stdout;
+    let checkoutPath: string | undefined;
+    const service = new GitRepositoryService({
+      runGit: (args) => args.at(-4) === 'remote'
+        ? git(...args.slice(0, -1), source)
+        : git(...args),
+    });
+    try {
+      await git('-C', source, 'init', '-b', 'main');
+      await git('-C', source, 'config', 'user.email', 'fixture@example.net');
+      await git('-C', source, 'config', 'user.name', 'DeployFlow Fixture');
+      await git('-C', source, 'config', 'commit.gpgsign', 'false');
+      await writeFile(join(source, 'Dockerfile'), 'FROM scratch\n');
+      await git('-C', source, 'add', 'Dockerfile');
+      await git('-C', source, 'commit', '-m', 'Reviewed revision');
+      const reviewed = (await git('-C', source, 'rev-parse', 'HEAD')).trim();
+      await writeFile(join(source, 'Dockerfile'), 'FROM scratch\nLABEL revision=new\n');
+      await git('-C', source, 'commit', '-am', 'Moved branch tip');
+      const tip = (await git('-C', source, 'rev-parse', 'HEAD')).trim();
+      expect(tip).not.toBe(reviewed);
+      const result = await service.prepareRepositoryAtCommit({ repositoryUrl, branch: 'main', commitHash: reviewed });
+      checkoutPath = result.repositoryPath;
+      expect(result.commitHash).toBe(reviewed);
+      expect(await readFile(join(checkoutPath, 'Dockerfile'), 'utf8')).toBe('FROM scratch\n');
+    } finally {
+      if (checkoutPath !== undefined) await service.cleanup(checkoutPath);
+      await rm(source, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('rejects an invalid URL before creating or cloning', async () => {
     const service = new GitRepositoryService({ runGit });

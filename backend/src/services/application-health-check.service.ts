@@ -3,6 +3,7 @@ import { request as requestHttps } from 'node:https';
 
 import { AppError } from '../utils/app-error.js';
 import { parseHealthCheckPath } from '../utils/health-check-path.js';
+import { isWorkloadAddress } from '../utils/workload-address.js';
 
 const DEFAULT_MAX_ATTEMPTS = 20;
 const DEFAULT_REQUEST_TIMEOUT_MS = 2_000;
@@ -10,6 +11,7 @@ const DEFAULT_RETRY_DELAY_MS = 1_000;
 
 export type ApplicationHealthCheckInput = {
   hostPort: number;
+  hostAddress?: string;
   path: string;
   hostname?: string;
   https?: true;
@@ -17,6 +19,7 @@ export type ApplicationHealthCheckInput = {
 
 export type LocalHealthRequest = (input: {
   hostPort: number;
+  hostAddress?: string;
   path: string;
   timeoutMs: number;
   hostname?: string;
@@ -33,6 +36,7 @@ type ApplicationHealthCheckDependencies = {
 
 const requestLocalHealth: LocalHealthRequest = ({
   hostPort,
+  hostAddress,
   path,
   timeoutMs,
   hostname,
@@ -41,7 +45,7 @@ const requestLocalHealth: LocalHealthRequest = ({
   new Promise((resolve, reject) => {
     const healthRequest = (https ? requestHttps : request)(
       {
-        hostname: '127.0.0.1',
+        hostname: hostAddress ?? '127.0.0.1',
         port: hostPort,
         path,
         method: 'GET',
@@ -98,6 +102,9 @@ export class ApplicationHealthCheckService {
   ): Promise<void> {
     const hostPort = parseHostPort(input.hostPort);
     const path = parseHealthCheckPath(input.path);
+    if (input.hostAddress !== undefined && (!isWorkloadAddress(input.hostAddress) || input.hostname !== undefined || input.https)) {
+      throw new AppError(400, 'Application health-check address is invalid');
+    }
     if (input.https && (input.hostname === undefined || hostPort !== 443)) {
       throw new AppError(400, 'An HTTPS health check requires a project hostname and port 443');
     }
@@ -113,6 +120,7 @@ export class ApplicationHealthCheckService {
       try {
         const statusCode = await this.#requestHealth({
           hostPort,
+          ...(input.hostAddress === undefined ? {} : { hostAddress: input.hostAddress }),
           path,
           timeoutMs: this.#requestTimeoutMs,
           ...(input.hostname === undefined ? {} : { hostname: input.hostname }),

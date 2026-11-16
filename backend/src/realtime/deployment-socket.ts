@@ -12,6 +12,7 @@ import {
   type DeploymentRecord,
 } from '../services/deployment.service.js';
 import { verifyAccessToken } from '../services/token.service.js';
+import { assertPublicOperator } from '../services/public-application-policy.js';
 
 const BEARER_TOKEN_PATTERN = /^Bearer\s+(\S+)$/i;
 const DEPLOYMENT_ROOM_PREFIX = 'deployment:';
@@ -143,12 +144,21 @@ export class DeploymentSocketGateway {
       return;
     }
 
+    let userId: string;
     try {
-      socket.data.userId = await this.#verifyToken(token);
-      next();
+      userId = await this.#verifyToken(token);
     } catch {
       next(new Error('Authentication required'));
+      return;
     }
+    try {
+      assertPublicOperator(userId);
+    } catch {
+      next(new Error('Public hosting management requires the configured operator'));
+      return;
+    }
+    socket.data.userId = userId;
+    next();
   }
 
   public broadcast(event: DeploymentEvent): void {

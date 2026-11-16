@@ -3,6 +3,7 @@ import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
 import { hashPassword, verifyPassword } from '../utils/password.js';
 import { createAccessToken } from './token.service.js';
+import { assertPublicOperator } from './public-application-policy.js';
 
 const publicUserSelect = {
   id: true,
@@ -73,6 +74,7 @@ export const loginUser = async (
     throw new AppError(401, 'Invalid email or password');
   }
 
+  assertPublicOperator(user.id);
   const token = await createAccessToken(user.id);
 
   return {

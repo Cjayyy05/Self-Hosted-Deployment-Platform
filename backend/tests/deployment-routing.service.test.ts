@@ -78,6 +78,7 @@ function harness(previous = true) {
   };
   const routes = {
     readPort, upsert: vi.fn(write), repair: vi.fn(write),
+    readTarget: () => Promise.resolve(route === null ? null : { address: '127.0.0.1', port: route }),
     remove: vi.fn((id: string, options?: Options) => write(id, undefined, options)),
   };
   const lease = { token, assertValid: vi.fn().mockResolvedValue(undefined) };
@@ -87,12 +88,15 @@ function harness(previous = true) {
     running.delete(id);
     return Promise.resolve({ containerId: id, running: false, status: 'exited' });
   });
+  const inspectStatus = (id: string) => ports.has(id)
+    ? Promise.resolve({ containerId: id, running: running.has(id), status: running.has(id) ? 'running' : 'exited' })
+    : Promise.reject(new AppError(404, 'Missing container'));
+  const inspectOwnedDeploymentContainer = vi.fn(inspectStatus);
+  const inspectLoopbackRoutingPort = vi.fn(({ containerId }: Target) => Promise.resolve(ports.get(containerId) ?? 0));
   const containers = {
-    inspectStatus: (id: string) => ports.has(id)
-      ? Promise.resolve({ containerId: id, running: running.has(id), status: 'running' })
-      : Promise.reject(new AppError(404, 'Missing container')),
-    inspectLoopbackRoutingPort: ({ containerId }: Target) => Promise.resolve(ports.get(containerId) ?? 0),
+    inspectStatus, inspectOwnedDeploymentContainer, inspectLoopbackRoutingPort,
     stopContainer: stop,
+    removeDeploymentContainers: vi.fn().mockResolvedValue(undefined),
     restartContainer: (id: string) => {
       running.add(id);
       return Promise.resolve({ containerId: id, running: true, status: 'running', hostPort: ports.get(id) ?? 0 });
@@ -108,6 +112,7 @@ function harness(previous = true) {
   );
   return {
     service: makeService(), makeService, project, candidate, previousRow, ports, running, lease, events, routes, health, stop,
+    inspectOwnedDeploymentContainer, inspectLoopbackRoutingPort,
     setRoute: (port: number | null) => { route = port; },
     failTransaction: (fault: 'before' | 'after') => { transactionFault = fault; },
   };
@@ -197,6 +202,34 @@ describe('deployment routing state transitions', () => {
     expect(await h.routes.readPort()).toBeNull();
     expect(h.stop).toHaveBeenCalledExactlyOnceWith(oldContainer);
     expect(h.project.activeDeploymentId).toBeNull();
+  });
+
+  it('stops a restarting deployment during reconciliation with no published port', async () => {
+    const h = harness();
+    h.inspectOwnedDeploymentContainer.mockResolvedValue({ containerId: oldContainer, status: 'restarting', running: true });
+    h.inspectLoopbackRoutingPort.mockRejectedValue(new Error('Container has no live binding'));
+    h.stop.mockRejectedValueOnce(new Error('Docker unavailable after withdrawal'));
+    await expect(h.service.stop(projectId, oldId, h.lease)).rejects.toMatchObject({ statusCode: 503 });
+    expect(h.project.routingOperation).toBe('STOP');
+    expect(await h.routes.readPort()).toBeNull();
+
+    const recovery = h.makeService();
+    await recovery.reconcile();
+    expect(h.inspectLoopbackRoutingPort).not.toHaveBeenCalled();
+    expect(h.running.has(oldContainer)).toBe(false);
+    expect(h.running.has(newContainer)).toBe(true);
+    expect(h.previousRow.status).toBe('STOPPED');
+    expect(h.project).toMatchObject({ activeDeploymentId: null, routingOperation: null, routingDeploymentId: null });
+    await expect(recovery.assertIdle(projectId, h.lease)).resolves.toBeUndefined();
+  });
+
+  it('leaves the verified active route alone when stopping a restarting historical container', async () => {
+    const h = harness();
+    h.inspectOwnedDeploymentContainer.mockResolvedValue({ containerId: newContainer, status: 'restarting', running: true });
+    await expect(h.service.stop(projectId, newId, h.lease)).resolves.toMatchObject({ status: 'STOPPED' });
+    expect(h.stop).toHaveBeenCalledExactlyOnceWith(newContainer);
+    expect(await h.routes.readPort()).toBe(50001);
+    expect(h.project).toMatchObject({ activeDeploymentId: oldId, routingOperation: null });
   });
 
   it('leaves a different active route alone during a historical restart', async () => {

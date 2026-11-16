@@ -42,13 +42,60 @@ function fixture(initial: unknown[] = [fallback]) {
 describe('ApplicationRoutingService', () => {
   it('limits public route writes to the configured project and verifies read-back', async () => {
     const { transport, docker } = fixture();
-    const service = new ApplicationRoutingService(transport, 'apps.example.net', docker, project);
+    let generation = 0n;
+    const service = new ApplicationRoutingService(transport, 'apps.example.net', docker, project, () => Promise.resolve(++generation));
+    const beforeWrite = () => Promise.resolve();
     await expect(service.upsert(second, container)).rejects.toMatchObject({ code: 'rejected' });
     expect(transport).not.toHaveBeenCalled();
-    await service.upsert(project, container, { healthPath: '/ready' });
+    await service.upsert(project, container, { healthPath: '/ready', beforeWrite });
     expect(await service.readPort(project)).toBe(49153);
-    await service.remove(project);
+    await service.remove(project, { beforeWrite });
     expect(await service.readPort(project)).toBeNull();
+  });
+
+  it('rejects a delayed publication when withdrawal and a bootstrap reset reuse the original ETag', async () => {
+    const { docker } = fixture();
+    let current = JSON.stringify([fallback]);
+    let revision = 1;
+    let generation = 0n;
+    let resume: (() => void) | undefined;
+    let delayed: (() => void) | undefined;
+    const pause = new Promise<void>((done) => { resume = done; });
+    const entered = new Promise<void>((done) => { delayed = done; });
+    const transport: CaddyAdminTransport = (input) => {
+      if (input.method === 'GET') return Promise.resolve(reply(200, current, tag(revision)));
+      if (input.etag !== tag(revision)) return Promise.resolve(reply(412));
+      current = input.body;
+      revision++;
+      return Promise.resolve(reply(200));
+    };
+    const allocate = () => Promise.resolve(++generation);
+    const beforeWrite = () => Promise.resolve();
+    const first = new ApplicationRoutingService(async (input) => {
+      if (input.method === 'PATCH' && input.body.includes('reverse_proxy')) {
+        delayed?.();
+        await pause;
+      }
+      return transport(input);
+    }, 'apps.example.net', docker, project, allocate);
+    const second = new ApplicationRoutingService(transport, 'apps.example.net', docker, project, allocate);
+    const publication = first.upsert(project, container, { beforeWrite }).then(
+      () => 'published',
+      (error: unknown) => error,
+    );
+    try {
+      await entered;
+      expect(revision).toBe(2);
+      await second.repair(project, undefined, { beforeWrite });
+      current = JSON.stringify([fallback]);
+      revision = 1;
+    } finally {
+      resume?.();
+    }
+    expect(await publication).toMatchObject({ code: 'conflict' });
+    expect(await second.readPort(project)).toBeNull();
+    expect(current).toBe(JSON.stringify([fallback]));
+    expect(generation).toBe(3n);
   });
   it('uses exact hosts and the inspected port, serializes projects, and preserves the final 404', async () => {
     const { service, transport, docker } = fixture();

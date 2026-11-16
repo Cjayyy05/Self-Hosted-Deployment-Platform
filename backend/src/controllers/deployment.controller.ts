@@ -3,12 +3,14 @@ import type { RequestHandler } from 'express';
 import { broadcastDeploymentEvent } from '../realtime/deployment-socket.js';
 import { deploymentService } from '../services/deployment.service.js';
 import { getAuthenticatedUserId } from '../utils/auth-request.js';
+import { parseDeploymentCommit } from '../utils/project-validation.js';
 
 export const deployProject: RequestHandler = async (request, response) => {
   const deployment = await deploymentService.deployProjectForUser(
     getAuthenticatedUserId(request),
     request.params.id,
     broadcastDeploymentEvent,
+    parseDeploymentCommit(request.body),
   );
 
   response.status(201).json({ deployment });
@@ -60,6 +62,7 @@ export const redeployDeployment: RequestHandler = async (request, response) => {
     getAuthenticatedUserId(request),
     request.params.id,
     broadcastDeploymentEvent,
+    parseDeploymentCommit(request.body),
   );
 
   response.status(201).json({ deployment });

@@ -3,14 +3,12 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { env, type PublicApplication } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
+import { parseGitBranch } from '../utils/git-revision.js';
 import { parseGitHubRepositoryUrl } from '../utils/github-repository.js';
-import { assertApprovedCommit, assertApprovedSource } from './public-application-policy.js';
 
 const TEMPORARY_DIRECTORY_PREFIX = 'deployflow-repository-';
 const COMMIT_HASH_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i;
-const ALLOWED_BRANCH_CHARACTERS = /^[A-Za-z0-9._/-]+$/;
 
 export type GitRepositoryInput = {
   repositoryUrl: string;
@@ -62,41 +60,11 @@ const executeGit: GitCommandRunner = (args) =>
     );
   });
 
-const parseBranch = (value: unknown): string => {
-  if (typeof value !== 'string') {
-    throw new AppError(400, 'Repository branch is required');
-  }
-
-  const branch = value.trim();
-  const segments = branch.split('/');
-  const hasInvalidSegment = segments.some(
-    (segment) =>
-      segment.length === 0 ||
-      segment.startsWith('.') ||
-      segment.endsWith('.') ||
-      segment.endsWith('.lock'),
-  );
-
-  if (
-    branch.length === 0 ||
-    branch.length > 255 ||
-    branch.startsWith('-') ||
-    branch.includes('..') ||
-    !ALLOWED_BRANCH_CHARACTERS.test(branch) ||
-    hasInvalidSegment
-  ) {
-    throw new AppError(400, 'Repository branch is invalid');
-  }
-
-  return branch;
-};
-
 export class GitRepositoryService {
   readonly #runGit: GitCommandRunner;
   readonly #managedDirectories = new Set<string>();
 
-  public constructor(dependencies: GitRepositoryServiceDependencies = {},
-    private readonly approved: PublicApplication | undefined = env.hosting.publicApp) {
+  public constructor(dependencies: GitRepositoryServiceDependencies = {}) {
     this.#runGit = dependencies.runGit ?? executeGit;
   }
 
@@ -104,8 +72,7 @@ export class GitRepositoryService {
     input: GitRepositoryInput,
   ): Promise<PreparedGitRepository> {
     const repository = parseGitHubRepositoryUrl(input.repositoryUrl);
-    const branch = parseBranch(input.branch);
-    assertApprovedSource(this.approved, { repositoryUrl: repository.repositoryUrl, branch });
+    const branch = parseGitBranch(input.branch);
     let repositoryPath: string;
 
     try {
@@ -150,7 +117,6 @@ export class GitRepositoryService {
       if (!COMMIT_HASH_PATTERN.test(commitHash)) {
         throw new AppError(422, 'Repository returned an invalid commit hash');
       }
-      assertApprovedCommit(this.approved, commitHash.toLowerCase());
 
       return {
         repositoryPath,
@@ -185,14 +151,12 @@ export class GitRepositoryService {
     input: GitRepositoryCommitInput,
   ): Promise<PreparedGitRepository> {
     const repository = parseGitHubRepositoryUrl(input.repositoryUrl);
-    const branch = parseBranch(input.branch);
+    const branch = parseGitBranch(input.branch);
     const commitHash = input.commitHash.trim().toLowerCase();
-    assertApprovedSource(this.approved, { repositoryUrl: repository.repositoryUrl, branch });
 
     if (!COMMIT_HASH_PATTERN.test(commitHash)) {
       throw new AppError(400, 'Repository commit hash is invalid');
     }
-    assertApprovedCommit(this.approved, commitHash);
 
     let repositoryPath: string;
 

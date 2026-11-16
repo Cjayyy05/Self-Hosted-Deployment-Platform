@@ -5,8 +5,12 @@ import { ProjectHostingService } from '../src/services/project-hosting.service.j
 const hostnameLabel = 'app-11111111111141118111111111111111';
 const hostname = hostnameLabel + '.localhost';
 const hosting = { origin: 'http://localhost:18083', hostnameSuffix: 'localhost', adminSocketPath: undefined };
-const active = { status: 'RUNNING', hostPort: 51001 } as const;
+const active = { status: 'RUNNING', hostPort: 51001, publicAddressIndex: null, commitHash: 'a'.repeat(40) } as const;
 const project = {
+  id: '11111111-1111-4111-8111-111111111111',
+  userId: '22222222-2222-4222-8222-222222222222',
+  repositoryUrl: 'https://github.com/example/app',
+  branch: 'main',
   hostnameLabel,
   healthCheckPath: '/health',
   activeDeployment: active,
@@ -15,8 +19,8 @@ const project = {
 };
 
 const setup = () => {
-  const route = new Map([[hostname, active.hostPort]]);
-  const routes = { readDashboardPorts: vi.fn<() => Promise<ReadonlyMap<string, number>>>().mockResolvedValue(route) };
+  const route = new Map([[hostname, { address: '127.0.0.1', port: active.hostPort }]]);
+  const routes = { readDashboardTargets: vi.fn<() => Promise<ReadonlyMap<string, { address: string; port: number }>>>().mockResolvedValue(route) };
   const health = { waitUntilHealthy: vi.fn<() => Promise<void>>().mockResolvedValue(undefined) };
   return { ...routes, ...health, service: new ProjectHostingService(routes, hosting, health) };
 };
@@ -24,7 +28,7 @@ const setup = () => {
 describe('project hosting status', () => {
   it('handles disabled hosting and skips Caddy for new projects and initial builds', async () => {
     const disabled = new ProjectHostingService(undefined, hosting);
-    const { service, readDashboardPorts } = setup();
+    const { service, readDashboardTargets } = setup();
     const newProject = { ...project, activeDeployment: null, deployments: [] };
     await expect(disabled.summarize(newProject)).resolves.toEqual({
       localApplicationUrl: null, hostingStatus: 'DISABLED',
@@ -34,7 +38,7 @@ describe('project hosting status', () => {
     });
     await expect(service.summarize({ ...newProject, deployments: [{ status: 'BUILDING' }] }))
       .resolves.toMatchObject({ hostingStatus: 'DEPLOYING' });
-    expect(readDashboardPorts).not.toHaveBeenCalled();
+    expect(readDashboardTargets).not.toHaveBeenCalled();
   });
 
   it('keeps a confirmed active route available during and after a failed replacement', async () => {
@@ -51,56 +55,62 @@ describe('project hosting status', () => {
   });
 
   it('checks health again with a fresh route snapshot or an edited health-check path', async () => {
-    const { service, waitUntilHealthy, readDashboardPorts } = setup();
+    const { service, waitUntilHealthy, readDashboardTargets } = setup();
     await service.summarize(project);
     await service.summarize({ ...project, healthCheckPath: '/new' });
-    readDashboardPorts.mockResolvedValue(new Map([[hostname, active.hostPort]]));
+    readDashboardTargets.mockResolvedValue(new Map([[hostname, { address: '127.0.0.1', port: active.hostPort }]]));
     await service.summarize(project);
     expect(waitUntilHealthy).toHaveBeenCalledTimes(3);
   });
 
   it('requires attention for unavailable admin, absent routes, and routes to the wrong deployment', async () => {
-    const { service, readDashboardPorts, waitUntilHealthy } = setup();
-    readDashboardPorts.mockRejectedValueOnce(new Error('Caddy stopped'));
+    const { service, readDashboardTargets, waitUntilHealthy } = setup();
+    readDashboardTargets.mockRejectedValueOnce(new Error('Caddy stopped'));
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
-    readDashboardPorts.mockResolvedValueOnce(new Map());
+    readDashboardTargets.mockResolvedValueOnce(new Map());
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
-    readDashboardPorts.mockResolvedValueOnce(new Map([[hostname, 51002]]));
+    readDashboardTargets.mockResolvedValueOnce(new Map([[hostname, { address: '127.0.0.1', port: 51002 }]]));
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
     expect(waitUntilHealthy).not.toHaveBeenCalled();
   });
 
   it('requires attention when the proxy fails or the route changes during its health check', async () => {
-    const { service, readDashboardPorts, waitUntilHealthy } = setup();
+    const { service, readDashboardTargets, waitUntilHealthy } = setup();
     waitUntilHealthy.mockRejectedValueOnce(new Error('Proxy timed out'));
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
-    readDashboardPorts.mockResolvedValueOnce(new Map([[hostname, active.hostPort]]))
+    readDashboardTargets.mockResolvedValueOnce(new Map([[hostname, { address: '127.0.0.1', port: active.hostPort }]]))
       .mockResolvedValueOnce(new Map());
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
   });
 
   it('returns a route-specific browser check after verified local TLS and rejects other projects', async () => {
     const publicHostname = hostnameLabel + '.apps.example.net';
-    const routes = { readDashboardPorts: vi.fn().mockResolvedValue(new Map([[publicHostname, active.hostPort]])) };
+    const routes = { readDashboardTargets: vi.fn().mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.1', port: 787 }]])) };
     const health = { waitUntilHealthy: vi.fn().mockResolvedValue(undefined) };
     const service = new ProjectHostingService(routes, {
       origin: 'https://apps.example.net', hostnameSuffix: 'apps.example.net', adminSocketPath: '/run/caddy/admin.sock',
-      publicApp: { projectId: '11111111-1111-4111-8111-111111111111', repositoryUrl: 'https://github.com/example/app',
-        branch: 'main', commits: new Set() },
-    }, health);
-    const verified = await service.summarize(project);
+      publicHosting: { operatorId: project.userId, routeProjectId: project.id },
+    }, health, { assertApproved: vi.fn().mockResolvedValue(undefined) });
+    const publicProject = { ...project, activeDeployment: { ...active, publicAddressIndex: 1, hostPort: 787 } };
+    const verified = await service.summarize(publicProject);
     expect(verified).toMatchObject({
       localApplicationUrl: null, publicApplicationUrl: 'https://' + publicHostname, hostingStatus: 'VERIFYING_HTTPS',
     });
     expect(verified.publicProbePath).toMatch(/^\/\.well-known\/deployflow-health\/[a-f0-9]{64}$/);
     expect(health.waitUntilHealthy).toHaveBeenCalledWith({
-      hostPort: 443, hostname: publicHostname, path: '/health', https: true,
+      hostPort: 443, hostname: publicHostname, path: verified.publicProbePath, https: true,
     });
-    await expect(service.summarize({ ...project, hostnameLabel: 'other' }))
+    await expect(service.summarize({ ...project, id: project.userId }))
       .resolves.toEqual({ localApplicationUrl: null, hostingStatus: 'DISABLED' });
-    routes.readDashboardPorts.mockResolvedValue(new Map([[publicHostname, active.hostPort]]));
+    const replacement = { ...publicProject, activeDeployment: { ...publicProject.activeDeployment, publicAddressIndex: 2 } };
+    await expect(service.summarize(replacement)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
+    routes.readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.2', port: 787 }]]));
+    const updated = await service.summarize(replacement);
+    expect(updated.hostingStatus).toBe('VERIFYING_HTTPS');
+    expect(updated.publicProbePath).not.toBe(verified.publicProbePath);
+    routes.readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.1', port: 787 }]]));
     health.waitUntilHealthy.mockRejectedValueOnce(new Error('certificate invalid'));
-    const unverified = await service.summarize(project);
+    const unverified = await service.summarize(publicProject);
     expect(unverified.hostingStatus).toBe('RECOVERING');
     expect(unverified.publicProbePath).toBeUndefined();
   });

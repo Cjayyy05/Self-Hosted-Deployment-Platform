@@ -32,6 +32,7 @@ const now = new Date('2026-09-04T01:00:00.000Z');
 
 const project = {
   id: projectId,
+  userId,
   repositoryUrl: 'https://github.com/example/example-api',
   branch: 'main',
   containerPort: 8080,
@@ -255,6 +256,7 @@ describe('DeploymentService', () => {
 
   const hostedRouting = () => ({
     assertIdle: vi.fn().mockResolvedValue(undefined),
+    assertPublicPortOwned: vi.fn().mockResolvedValue(undefined),
     promote: vi.fn().mockRejectedValue(new RoutingPendingError()),
     stop: vi.fn().mockResolvedValue(null),
     beginRestart: vi.fn().mockResolvedValue(false),

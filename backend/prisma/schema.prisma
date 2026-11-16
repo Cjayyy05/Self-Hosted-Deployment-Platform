@@ -42,6 +42,7 @@ model User {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   projects     Project[]
+  publicApprovals ProjectPublicApproval[]
 }
 
 model Project {
@@ -65,9 +66,45 @@ model Project {
   activeDeployment  Deployment?             @relation("ActiveDeployment", fields: [id, activeDeploymentId], references: [projectId, id], onDelete: NoAction, onUpdate: NoAction)
   routingDeployment Deployment?             @relation("RoutingDeployment", fields: [id, routingDeploymentId], references: [projectId, id], onDelete: NoAction, onUpdate: NoAction)
   webhookDeliveries GitHubWebhookDelivery[]
+  publicApproval    ProjectPublicApproval?
 
   @@index([userId])
   @@index([operationLockExpiresAt])
+}
+
+model ProjectPublicApproval {
+  projectId     String                  @id @db.Uuid
+  repositoryUrl String
+  branch        String                  @db.VarChar(255)
+  approvedById  String                  @db.Uuid
+  approvedAt    DateTime                @default(now())
+  revokedAt     DateTime?
+  withdrawnAt   DateTime?
+  project       Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  approvedBy    User                    @relation(fields: [approvedById], references: [id], onDelete: Restrict)
+  revisions     ProjectPublicRevision[]
+}
+
+model PublicRoutingBinding {
+  id                    Int     @id
+  projectId             String? @db.Uuid
+  hostnameSuffix        String
+  adminSocketPath       String
+  routeGeneration       BigInt  @default(0)
+  routeRecoveryRequired Boolean @default(false)
+  nextWorkloadAddress   Int     @default(0)
+  ingressSocketPath     String  @default("/run/deployflow-ingress/auth.sock")
+  cutoverBootId         String? @db.Uuid
+}
+
+model ProjectPublicRevision {
+  projectId  String                @db.Uuid
+  commitHash String                @db.VarChar(40)
+  approvedAt DateTime              @default(now())
+  revokedAt  DateTime?
+  approval   ProjectPublicApproval @relation(fields: [projectId], references: [projectId], onDelete: Cascade)
+
+  @@id([projectId, commitHash])
 }
 
 model GitHubWebhookDelivery {
@@ -91,6 +128,11 @@ model Deployment {
   imageId                    String?
   imageTag                   String?
   hostPort                   Int?
+  publicAddressIndex         Int?             @unique
+  buildNetworkId             String?          @unique
+  guardedBuild               Boolean          @default(false)
+  buildHostBootId            String?          @db.Uuid
+  buildEndedAt               DateTime?
   errorMessage               String?
   startedAt                  DateTime?
   finishedAt                 DateTime?
