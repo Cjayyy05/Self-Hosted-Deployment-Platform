@@ -1,5 +1,6 @@
 import type { RequestHandler } from 'express';
 
+import { env } from '../config/env.js';
 import {
   getAuthenticatedUser,
   loginUser,
@@ -7,6 +8,10 @@ import {
 } from '../services/auth.service.js';
 import { AppError } from '../utils/app-error.js';
 import { parseLogin, parseRegistration } from '../utils/auth-validation.js';
+
+export const getAuthFeatures: RequestHandler = (_request, response) => {
+  response.set('Cache-Control', 'no-store').json({ registrationEnabled: env.registrationEnabled });
+};
 
 export const register: RequestHandler = async (request, response) => {
   const { email, password } = parseRegistration(request.body);

@@ -29,7 +29,11 @@ type LogEntry = {
 };
 
 type SubscriptionResult =
-  | { ok: true; room: string }
+  | { ok: true; room: string; logHistory?: {
+    source: "deployment" | "build";
+    message: string;
+    timestamp: number;
+  }[] }
   | { ok: false; error: string };
 
 type ClientToServerEvents = {
@@ -182,6 +186,14 @@ export function DeploymentLogsPanel({
         { deploymentId },
         (result) => {
           if (result.ok) {
+            if (result.logHistory !== undefined) {
+              setLogs(result.logHistory.map(({ timestamp, source, message }) => ({
+                id: nextLogId.current++,
+                receivedAt: new Date(timestamp),
+                source,
+                message,
+              })));
+            }
             setConnectionState("connected");
             return;
           }
@@ -276,7 +288,7 @@ export function DeploymentLogsPanel({
             </span>
           </div>
           <p className="mt-1 text-xs text-slate-400">
-            Live events for one selected deployment. Historical events are not replayed.
+            Recent logs and live events for the selected deployment.
           </p>
         </div>
 

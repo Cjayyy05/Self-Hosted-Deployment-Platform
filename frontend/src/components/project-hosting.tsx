@@ -13,6 +13,14 @@ const statuses: Record<HostingStatus, { label: string; style: string }> = {
   RECOVERING: { label: "Recovering or requires attention", style: "border-amber-200 bg-amber-50 text-amber-800" },
 };
 
+export const APPROVAL_LABELS: Record<NonNullable<Project["approvalStatus"]>, string> = {
+  UNAPPROVED: "Approval required",
+  APPROVED: "Approved",
+  WITHDRAWAL_PENDING: "Withdrawal pending",
+  REVOKED: "Hosting revoked",
+  UNKNOWN: "Approval unverified",
+};
+
 function usePublicAvailability(url: string | undefined, path: string | undefined) {
   const probe = url && path ? url + path : undefined;
   const [verified, setVerified] = useState<{ probe: string; signal: AbortSignal }>();
@@ -58,39 +66,74 @@ export function ProjectHosting({
   project,
   isChangingRoute = false,
 }: {
-  project: Pick<Project, "hostingStatus" | "localApplicationUrl" | "publicApplicationUrl" | "publicProbePath">;
+  project: Project;
   isChangingRoute?: boolean;
 }) {
-  const { localApplicationUrl, publicApplicationUrl, publicProbePath, hostingStatus } = project;
-  const applicationUrl = publicApplicationUrl ?? localApplicationUrl;
-  const requiresPublicProbe = publicApplicationUrl !== undefined &&
-    (hostingStatus === "VERIFYING_HTTPS" || hostingStatus === "AVAILABLE");
-  const available = usePublicAvailability(publicApplicationUrl, requiresPublicProbe && !isChangingRoute ? publicProbePath : undefined);
-  const routeStatus = requiresPublicProbe
-    ? (available ? "AVAILABLE" : "VERIFYING_HTTPS")
-    : hostingStatus;
-  const status = isChangingRoute && routeStatus === "AVAILABLE" ? "RECOVERING" : routeStatus;
+  const { localApplicationUrl, publicApplicationUrl, publicProbePath, hostingStatus, approvalStatus, certificateStatus } = project;
+  const isPublic = project.publicHostingEnabled === true;
+  const isApproved = approvalStatus === "APPROVED";
+  const applicationUrl = isPublic ? (isApproved ? publicApplicationUrl ?? null : null) : localApplicationUrl;
+  const routeCanBeVerified = isPublic && isApproved && !isChangingRoute &&
+    certificateStatus === "READY" && hostingStatus === "AVAILABLE";
+  const available = usePublicAvailability(
+    publicApplicationUrl,
+    routeCanBeVerified ? publicProbePath : undefined,
+  );
+  const [copyResult, setCopyResult] = useState<{ url: string; message: string }>();
+  const status = isChangingRoute ? "RECOVERING"
+    : isPublic && !isApproved ? "UNAVAILABLE"
+      : isPublic && hostingStatus === "AVAILABLE" && !available ? "VERIFYING_HTTPS"
+        : hostingStatus;
   const { label, style } = statuses[status];
 
+  async function copyUrl(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopyResult({ url, message: "Public URL copied." });
+    } catch {
+      setCopyResult({ url, message: "Clipboard unavailable. Select and copy the URL shown above." });
+    }
+  }
+
   return (
-    <div className="space-y-2" aria-label="Application hosting">
+    <div className="min-w-0 space-y-2" aria-label="Application hosting">
       <div className="flex flex-wrap items-center gap-2">
         <span role="status" className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${style}`}>
-          {label}
+          {isChangingRoute ? "Updating hosting" : label}
         </span>
         {applicationUrl !== null ? (
-          <span className="text-xs font-medium text-slate-600">{publicApplicationUrl ? "Public · HTTPS" : "Local only · HTTP"}</span>
+          <span className="text-xs font-medium text-slate-600">{isPublic ? "Public · HTTPS" : "Local only · HTTP"}</span>
         ) : null}
       </div>
+      {isPublic && (
+        <dl className="space-y-1.5 text-sm text-slate-700">
+          <div><dt className="inline font-medium">Approval</dt>{" · "}<dd className="inline">{APPROVAL_LABELS[approvalStatus ?? "UNKNOWN"]}</dd></div>
+          <div><dt className="inline font-medium">Public hostname</dt>{" · "}<dd className="inline break-all font-mono text-xs">{project.publicHostname ?? "—"}</dd></div>
+          <div><dt className="inline font-medium">Certificate</dt>{" · "}<dd className="inline">{!isChangingRoute && isApproved && certificateStatus === "READY" ? "Ready" : "Unverified"}</dd></div>
+        </dl>
+      )}
+      {project.hostingError && (
+        <p className="text-sm text-red-700">{project.hostingError.message}</p>
+      )}
       {applicationUrl !== null ? (
         <p className="break-all font-mono text-xs text-slate-700">{applicationUrl}</p>
       ) : null}
       {status === "AVAILABLE" && applicationUrl !== null ? (
-        <a className="button-secondary" href={applicationUrl} rel="noreferrer" target="_blank">
-          Open Application
-          <span className="sr-only"> (opens in a new tab)</span>
-        </a>
+        <div className="flex flex-wrap gap-2">
+          <a className="button-secondary" href={applicationUrl} rel="noreferrer" target="_blank">
+            {isPublic ? "Open website" : "Open Application"}
+            <span className="sr-only"> (opens in a new tab)</span>
+          </a>
+          {isPublic && (
+            <button className="button-secondary" onClick={() => void copyUrl(applicationUrl)} type="button">
+              Copy public URL
+            </button>
+          )}
+        </div>
       ) : null}
+      {status === "AVAILABLE" && copyResult?.url === applicationUrl && (
+        <p className="text-xs text-slate-600" role="status">{copyResult.message}</p>
+      )}
     </div>
   );
 }

@@ -10,7 +10,7 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 export default function LoginPage() {
   const router = useRouter();
-  const { login, status } = useAuth();
+  const { login, registrationEnabled, status } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -53,7 +53,7 @@ export default function LoginPage() {
     <AuthShell
       description="Use the account connected to your DeployFlow instance."
       eyebrow="Welcome back"
-      footerHref="/register"
+      footerHref={registrationEnabled ? "/register" : undefined}
       footerLabel="Create one"
       footerPrompt="Need an account?"
       title="Sign in to continue"

@@ -5,6 +5,10 @@ const backendApiUrl = (
 ).replace(/\/$/, "");
 
 const nextConfig: NextConfig = {
+  experimental: {
+    // The deployment request spans the Docker build and initial TLS verification.
+    proxyTimeout: 15 * 60_000,
+  },
   async rewrites() {
     return [
       {

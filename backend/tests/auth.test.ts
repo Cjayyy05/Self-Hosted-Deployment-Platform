@@ -30,6 +30,14 @@ beforeEach(() => {
   databaseMocks.findUnique.mockReset();
 });
 
+it('reports the instance registration setting without returning account or session data', async () => {
+  const response = await request(createApp()).get('/api/auth/features');
+
+  expect(response.status).toBe(200);
+  expect(response.headers['cache-control']).toBe('no-store');
+  expect(response.body).toEqual({ registrationEnabled: true });
+});
+
 describe('POST /api/auth/register', () => {
   it('rejects registration cleanly when the operator disables it', async () => {
     await expect(

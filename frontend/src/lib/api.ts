@@ -7,16 +7,23 @@ export type AuthUser = {
   updatedAt: string;
 };
 
-export type Project = {
+type PublicHostingSummary = {
+  publicHostname?: string;
+  publicApplicationUrl?: string;
+  publicProbePath?: string;
+  approvalStatus?: ApprovalStatus | "UNKNOWN";
+  certificateStatus?: "READY" | "UNVERIFIED";
+  hostingError?: { code: string; message: string };
+  hostingStatus: HostingStatus;
+};
+
+export type Project = PublicHostingSummary & {
   id: string;
   hostnameLabel: string;
   localApplicationUrl: string | null;
-  publicApplicationUrl?: string;
-  publicProbePath?: string;
   publicHostingEnabled?: true;
-  hostingStatus: HostingStatus;
   activeDeployment: DeploymentSummary | null;
-  latestDeployment: DeploymentSummary | null;
+  latestDeployment: (DeploymentSummary & Pick<Deployment, "errorMessage">) | null;
   userId: string;
   name: string;
   repositoryUrl: string;
@@ -77,6 +84,22 @@ export type Deployment = {
 export type DeploymentSummary = Pick<Deployment, "id" | "status" | "commitHash" | "createdAt">;
 export const PROJECT_REFRESH_INTERVAL_MS = 5_000;
 
+export type ApprovalStatus = "UNAPPROVED" | "APPROVED" | "WITHDRAWAL_PENDING" | "REVOKED";
+
+export type PublicApproval = { status: "UNAPPROVED" } | {
+  status: Exclude<ApprovalStatus, "UNAPPROVED">;
+  source: "DATABASE" | "LEGACY";
+  repositoryUrl: string;
+  branch: string;
+  approvedById: string;
+  approvedAt: string | null;
+  revokedAt: string | null;
+  withdrawnAt: string | null;
+  commits: string[];
+};
+
+export type ApprovalInput = Pick<Project, "repositoryUrl" | "branch"> & { commitHash: string };
+
 export type DeploymentMetrics = {
   status: DeploymentStatus;
   cpu: {
@@ -107,7 +130,8 @@ type UserResponse = { user: AuthUser };
 type LoginResponse = UserResponse & { token: string };
 type ProjectResponse = { project: Project };
 type ProjectsResponse = { projects: Project[] };
-type DeploymentResponse = { deployment: Deployment };
+type PublicApprovalResponse = { approval: PublicApproval };
+type DeploymentResponse = { deployment: Deployment; hosting?: PublicHostingSummary };
 type DeploymentsResponse = { deployments: Deployment[] };
 type DeploymentMetricsResponse = { metrics: DeploymentMetrics };
 type GitHubWebhookResponse = { webhook: GitHubWebhookConfiguration };
@@ -175,6 +199,10 @@ const request = async <T>(
 };
 
 export const authApi = {
+  async getFeatures(signal?: AbortSignal): Promise<{ registrationEnabled: boolean }> {
+    return request("/auth/features", { signal });
+  },
+
   async login(email: string, password: string): Promise<LoginResponse> {
     return request<LoginResponse>("/auth/login", {
       method: "POST",
@@ -245,6 +273,30 @@ export const projectApi = {
     return response.project;
   },
 
+  async getPublicApproval(token: string, projectId: string, signal?: AbortSignal): Promise<PublicApproval> {
+    const response = await request<PublicApprovalResponse>(
+      `/projects/${encodeURIComponent(projectId)}/public-approval`,
+      { token, signal },
+    );
+    return response.approval;
+  },
+
+  async approveRevision(token: string, projectId: string, input: ApprovalInput): Promise<PublicApproval> {
+    const response = await request<PublicApprovalResponse>(
+      `/projects/${encodeURIComponent(projectId)}/public-approval`,
+      { method: "PUT", token, body: JSON.stringify(input) },
+    );
+    return response.approval;
+  },
+
+  async revokePublicApproval(token: string, projectId: string): Promise<PublicApproval> {
+    const response = await request<PublicApprovalResponse>(
+      `/projects/${encodeURIComponent(projectId)}/public-approval`,
+      { method: "DELETE", token },
+    );
+    return response.approval;
+  },
+
   async listDeployments(
     token: string,
     projectId: string,
@@ -273,19 +325,22 @@ export const projectApi = {
 const deploymentAction = async (
   token: string,
   path: string,
+  commitHash?: string,
 ): Promise<Deployment> => {
   const response = await request<DeploymentResponse>(path, {
     method: "POST",
     token,
+    ...(commitHash === undefined ? {} : { body: JSON.stringify({ commitHash }) }),
   });
   return response.deployment;
 };
 
 export const deploymentApi = {
-  async deploy(token: string, projectId: string): Promise<Deployment> {
+  async deploy(token: string, projectId: string, commitHash?: string): Promise<Deployment> {
     return deploymentAction(
       token,
       `/projects/${encodeURIComponent(projectId)}/deploy`,
+      commitHash,
     );
   },
 
@@ -303,10 +358,11 @@ export const deploymentApi = {
     );
   },
 
-  async redeploy(token: string, deploymentId: string): Promise<Deployment> {
+  async redeploy(token: string, deploymentId: string, commitHash?: string): Promise<Deployment> {
     return deploymentAction(
       token,
       `/deployments/${encodeURIComponent(deploymentId)}/redeploy`,
+      commitHash,
     );
   },
 

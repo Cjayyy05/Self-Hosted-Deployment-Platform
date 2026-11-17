@@ -146,6 +146,22 @@ describe('deployment Socket.IO gateway', () => {
     });
   });
 
+  it('replays bounded recent logs only after a subscriber proves ownership', async () => {
+    for (let index = 0; index <= 100; index += 1) {
+      broadcastDeploymentEvent({ type: 'log', deploymentId, source: 'build', message: `Step ${String(index)}` });
+    }
+    const client = await connect(token);
+    getDeploymentForUser.mockRejectedValueOnce(new AppError(404, 'Deployment not found'));
+    await expect(subscribe(client, deploymentId)).resolves.toEqual({ ok: false, error: 'Deployment not found' });
+
+    const allowed = await subscribe(client, deploymentId);
+    if (!allowed.ok) throw new Error(allowed.error);
+    expect(allowed.logHistory).toHaveLength(100);
+    expect(allowed.logHistory?.[0]).toMatchObject({ source: 'build', message: 'Step 1' });
+    expect(typeof allowed.logHistory?.[0]?.timestamp).toBe('number');
+    expect(allowed.logHistory?.at(-1)?.message).toBe('Step 100');
+  });
+
   it('broadcasts deployment callback events only to the deployment room', async () => {
     const subscribedClient = await connect(token);
     const otherClient = await connect(token);

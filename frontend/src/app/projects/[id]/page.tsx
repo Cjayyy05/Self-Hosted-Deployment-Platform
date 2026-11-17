@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
 import { DeploymentLogsPanel } from "@/components/deployment-logs-panel";
 import { DeploymentMetricsPanel } from "@/components/deployment-metrics-panel";
@@ -16,6 +16,7 @@ import {
   projectApi,
   type Deployment,
   type Project,
+  type PublicApproval,
 } from "@/lib/api";
 import {
   DEPLOYMENT_STATUS_LABELS,
@@ -41,6 +42,7 @@ const ACTION_PENDING_LABELS: Record<DeploymentAction, string> = {
 };
 
 const NEW_DEPLOYMENT_POLL_INTERVAL_MS = 750;
+const FULL_COMMIT_SHA = /^[a-f0-9]{40}$/;
 
 const isValidHealthCheckPath = (value: string): boolean =>
   value.length > 0 &&
@@ -86,6 +88,10 @@ function ProjectDetailsSkeleton() {
 
 export default function ProjectDetailsPage() {
   const { id: projectId } = useParams<{ id: string }>();
+  return <ProjectDetails key={projectId} projectId={projectId} />;
+}
+
+function ProjectDetails({ projectId }: { projectId: string }) {
   const { logout, token } = useAuth();
   const [project, setProject] = useState<Project | null>(null);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -93,6 +99,11 @@ export default function ProjectDetailsPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [approval, setApproval] = useState<PublicApproval | null>(null);
+  const [approvalError, setApprovalError] = useState<string | null>(null);
+  const [pendingApproval, setPendingApproval] = useState<"approve" | "revoke" | null>(null);
+  const [commitInput, setCommitInput] = useState("");
+  const [selectedCommit, setSelectedCommit] = useState("");
   const [pendingAction, setPendingAction] = useState<DeploymentAction | null>(null);
   const [pendingRollbackId, setPendingRollbackId] = useState<string | null>(null);
   const [healthCheckPath, setHealthCheckPath] = useState("/");
@@ -114,8 +125,20 @@ export default function ProjectDetailsPage() {
           projectApi.get(token, projectId, signal),
           projectApi.listDeployments(token, projectId, signal),
         ]);
+        let approvalResult: PublicApproval | null = null;
+        let approvalFailure: string | null = null;
+        if (projectResult.publicHostingEnabled) {
+          try {
+            approvalResult = await projectApi.getPublicApproval(token, projectId, signal);
+          } catch (error) {
+            if (error instanceof ApiError && error.status === 401) throw error;
+            approvalFailure = error instanceof Error ? error.message : "Unable to verify public hosting approval.";
+          }
+        }
         if (signal?.aborted || id !== requestId.current) return;
         setProject(projectResult);
+        setApproval(approvalResult);
+        setApprovalError(approvalFailure);
         if (showLoading) setHealthCheckPath(projectResult.healthCheckPath);
         setDeployments(deploymentResult);
         setLoadError(null);
@@ -215,18 +238,90 @@ export default function ProjectDetailsPage() {
   const deploymentBusy =
     latestDeployment !== null && isDeploymentInProgress(latestDeployment.status);
   const actionsBusy =
-    pendingAction !== null || pendingRollbackId !== null || deploymentBusy;
+    pendingAction !== null || pendingRollbackId !== null || pendingApproval !== null || isSavingHealthCheck || deploymentBusy;
   const publicHosting = project?.publicHostingEnabled === true;
+  const approvalStatus = approval?.status === "APPROVED" && project?.approvalStatus !== "APPROVED"
+    ? "UNKNOWN"
+    : approval?.status ?? "UNKNOWN";
+  const approvedCommits = approvalStatus === "APPROVED" && approval?.status === "APPROVED" ? approval.commits : [];
+  const canLaunchRevision = (sha: string | null | undefined) =>
+    !publicHosting || (sha != null && approvedCommits.includes(sha));
+  const deploymentCommit = approvedCommits.includes(selectedCommit) ? selectedCommit : "";
+  const canApprove = publicHosting && approvalStatus !== "UNKNOWN" && approvalStatus !== "WITHDRAWAL_PENDING";
+  const canRevoke = publicHosting && (approvalStatus === "APPROVED" || approvalStatus === "WITHDRAWAL_PENDING");
   const actionAvailability = {
-    deploy: !publicHosting && latestDeployment === null && !actionsBusy,
-    stop: runningDeployment?.status === "RUNNING" && runningDeployment.containerId !== null && !actionsBusy,
+    deploy: latestDeployment === null && canLaunchRevision(deploymentCommit) && !actionsBusy,
+    stop: runningDeployment?.status === "RUNNING" && runningDeployment.containerId !== null &&
+      approvalStatus !== "WITHDRAWAL_PENDING" && !actionsBusy,
     restart: restartTarget?.containerId != null && (!publicHosting || restartTarget.publicAddressIndex != null) &&
+      canLaunchRevision(restartTarget.commitHash) &&
       (restartTarget.status === "RUNNING" || restartTarget.status === "STOPPED") && !actionsBusy,
-    redeploy: !publicHosting && latestDeployment !== null && !actionsBusy,
+    redeploy: latestDeployment !== null && canLaunchRevision(deploymentCommit) && !actionsBusy,
+  };
+
+  const approveRevision = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (token === null || project === null || actionsBusy || !canApprove) return;
+    const commitHash = commitInput.trim().toLowerCase();
+    setActionSuccess(null);
+    if (!FULL_COMMIT_SHA.test(commitHash)) {
+      setActionError("Enter a full 40-character Git commit SHA.");
+      return;
+    }
+    setPendingApproval("approve");
+    setActionError(null);
+    try {
+      const result = await projectApi.approveRevision(token, projectId, {
+        repositoryUrl: project.repositoryUrl,
+        branch: project.branch,
+        commitHash,
+      });
+      requestId.current += 1;
+      setApproval(result);
+      setCommitInput("");
+      setActionSuccess("Revision approved. Select the revision to deploy.");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        logout();
+        return;
+      }
+      setActionError(error instanceof Error ? error.message : "The revision could not be approved.");
+    } finally {
+      await loadProject(undefined, false);
+      setPendingApproval(null);
+    }
+  };
+
+  const revokeHosting = async () => {
+    if (token === null || actionsBusy || !canRevoke) return;
+    if (approvalStatus === "APPROVED" &&
+      !window.confirm("Revoke public hosting? This withdraws the website, removes its containers, and revokes all approved revisions.")) return;
+
+    setPendingApproval("revoke");
+    setActionError(null);
+    setActionSuccess(null);
+    try {
+      const result = await projectApi.revokePublicApproval(token, projectId);
+      requestId.current += 1;
+      setApproval(result);
+      setSelectedCommit("");
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        logout();
+        return;
+      }
+      setActionError(error instanceof Error ? error.message : "Public hosting could not be revoked.");
+    } finally {
+      await loadProject(undefined, false);
+      setPendingApproval(null);
+    }
   };
 
   const runAction = async (action: DeploymentAction) => {
     if (token === null || !actionAvailability[action]) return;
+    if (action === "stop" && !window.confirm("Stop the running deployment? The application will become unavailable.")) return;
+    if (action === "restart" && restartTarget?.status === "RUNNING" &&
+      !window.confirm("Restart the running deployment? The application may be briefly unavailable.")) return;
 
     setPendingAction(action);
     setActionError(null);
@@ -242,15 +337,16 @@ export default function ProjectDetailsPage() {
 
     try {
       let actionDeployment: Deployment | null = null;
+      const commitHash = publicHosting ? deploymentCommit : undefined;
 
       if (action === "deploy") {
-        actionDeployment = await deploymentApi.deploy(token, projectId);
+        actionDeployment = await deploymentApi.deploy(token, projectId, commitHash);
       } else if (action === "stop" && runningDeployment !== undefined) {
         actionDeployment = await deploymentApi.stop(token, runningDeployment.id);
       } else if (action === "restart" && restartTarget !== undefined) {
         actionDeployment = await deploymentApi.restart(token, restartTarget.id);
       } else if (action === "redeploy" && latestDeployment !== null) {
-        actionDeployment = await deploymentApi.redeploy(token, latestDeployment.id);
+        actionDeployment = await deploymentApi.redeploy(token, latestDeployment.id, commitHash);
       }
 
       trackingController.abort();
@@ -258,6 +354,8 @@ export default function ProjectDetailsPage() {
         setSelectedDeploymentId(actionDeployment.id);
       }
       await loadProject(undefined, false, actionDeployment?.id);
+      if (actionDeployment?.status === "STOPPED") setActionSuccess("Deployment stopped.");
+      if (actionDeployment?.status === "RUNNING") setActionSuccess("Deployment is running.");
     } catch (requestError: unknown) {
       if (requestError instanceof ApiError && requestError.status === 401) {
         logout();
@@ -278,15 +376,13 @@ export default function ProjectDetailsPage() {
     }
   };
 
+  const canRollback = (deployment: Deployment) =>
+    deployment.status === "STOPPED" && deployment.commitHash !== null &&
+    canLaunchRevision(deployment.commitHash) && !actionsBusy;
+
   const runRollback = async (sourceDeployment: Deployment) => {
-    if (
-      token === null ||
-      actionsBusy ||
-      sourceDeployment.status !== "STOPPED" ||
-      sourceDeployment.commitHash === null
-    ) {
-      return;
-    }
+    if (token === null || !canRollback(sourceDeployment)) return;
+    if (!window.confirm(`Roll back to revision ${sourceDeployment.commitHash}?`)) return;
 
     setPendingRollbackId(sourceDeployment.id);
     setActionError(null);
@@ -329,7 +425,7 @@ export default function ProjectDetailsPage() {
   };
 
   const saveHealthCheckPath = async () => {
-    if (token === null || project === null || isSavingHealthCheck) return;
+    if (token === null || project === null || actionsBusy) return;
     const normalizedPath = healthCheckPath.trim();
     if (!isValidHealthCheckPath(normalizedPath)) {
       setActionError("Health-check path must start with /, such as /health.");
@@ -345,9 +441,8 @@ export default function ProjectDetailsPage() {
         project.id,
         normalizedPath,
       );
-      requestId.current += 1;
-      setProject(updatedProject);
       setHealthCheckPath(updatedProject.healthCheckPath);
+      await loadProject(undefined, false);
       setActionSuccess("Health-check path updated.");
     } catch (requestError: unknown) {
       if (requestError instanceof ApiError && requestError.status === 401) {
@@ -363,6 +458,26 @@ export default function ProjectDetailsPage() {
       setIsSavingHealthCheck(false);
     }
   };
+
+  const primaryAction = pendingAction === "deploy" || latestDeployment === null ? "deploy" : "redeploy";
+  const visibleActions: DeploymentAction[] = publicHosting
+    ? [primaryAction, "stop", "restart"]
+    : ["deploy", "stop", "restart", "redeploy"];
+  const deploymentActions = (
+    <div className="flex flex-wrap gap-3" aria-label="Deployment actions">
+      {visibleActions.map((action) => (
+          <button
+            className={action === "deploy" || action === "redeploy" ? "button-primary" : "button-secondary"}
+            disabled={!actionAvailability[action]}
+            key={action}
+            onClick={() => void runAction(action)}
+            type="button"
+          >
+            {pendingAction === action ? ACTION_PENDING_LABELS[action] : ACTION_LABELS[action]}
+          </button>
+      ))}
+    </div>
+  );
 
   return (
     <div className="flex-1 bg-slate-50 px-6 py-10 lg:px-8 lg:py-12">
@@ -421,30 +536,8 @@ export default function ProjectDetailsPage() {
                 </a>
               </div>
 
-              <div className="flex flex-wrap gap-3" aria-label="Deployment actions">
-                {(
-                  ["deploy", "stop", "restart", "redeploy"] as const
-                ).map((action) => (
-                  <button
-                    className={action === "deploy" || action === "redeploy" ? "button-primary" : "button-secondary"}
-                    disabled={!actionAvailability[action]}
-                    key={action}
-                    onClick={() => void runAction(action)}
-                    type="button"
-                  >
-                    {pendingAction === action
-                      ? ACTION_PENDING_LABELS[action]
-                      : ACTION_LABELS[action]}
-                  </button>
-                ))}
-              </div>
+              {!publicHosting && deploymentActions}
             </div>
-
-            {publicHosting && (
-              <p className="mt-3 text-sm text-slate-600">
-                Use the private API with an approved Git SHA to deploy or redeploy this project.
-              </p>
-            )}
 
             {deploymentBusy ? (
               <div
@@ -477,12 +570,12 @@ export default function ProjectDetailsPage() {
             <div className="mt-8 grid gap-5 lg:grid-cols-3">
               <section className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm lg:col-span-2">
                 <h2 className="text-lg font-semibold tracking-tight text-slate-950">
-                  Application hosting
+                  {publicHosting ? "Public Hosting" : "Application hosting"}
                 </h2>
                 <div className="mt-4 flex flex-wrap items-start justify-between gap-5 border-b border-slate-100 pb-5">
                   <ProjectHosting
-                    project={project}
-                    isChangingRoute={pendingAction === "stop" || pendingAction === "restart"}
+                    project={publicHosting ? { ...project, approvalStatus } : project}
+                    isChangingRoute={pendingApproval === "revoke" || pendingAction === "stop" || pendingAction === "restart"}
                   />
                   <div>
                     <p className="text-xs font-medium tracking-wide text-slate-500 uppercase">
@@ -492,6 +585,7 @@ export default function ProjectDetailsPage() {
                       <p className="mt-2 text-sm text-slate-600">No active hosted deployment</p>
                     ) : (
                       <>
+                        <div className="mt-2"><StatusBadge status={activeDeployment.status} /></div>
                         <p className="mt-2 break-all font-mono text-xs text-slate-800">{activeDeployment.id}</p>
                         {activeDeployment.commitHash !== null ? (
                           <p className="mt-1 break-all font-mono text-xs text-slate-600">{activeDeployment.commitHash}</p>
@@ -512,6 +606,80 @@ export default function ProjectDetailsPage() {
                     </a>
                   ) : null}
                 </div>
+                {publicHosting && (
+                  <div className="space-y-5 border-b border-slate-100 py-5">
+                    {approvalError && (
+                      <div className="flex flex-wrap items-center gap-3">
+                        <p className="text-sm text-red-700" role="alert">{approvalError}</p>
+                        <button className="button-secondary" onClick={() => void loadProject(undefined, false)} type="button">
+                          Refresh approval
+                        </button>
+                      </div>
+                    )}
+                    {approvalStatus === "WITHDRAWAL_PENDING" && (
+                      <p className="text-sm text-amber-800" role="status">
+                        Approval is revoked. The backend is still verifying route and workload removal.
+                      </p>
+                    )}
+                    {approvalStatus === "REVOKED" && (
+                      <p className="text-sm text-slate-700" role="status">Public hosting withdrawal verified.</p>
+                    )}
+                    {canApprove && (
+                      <form onSubmit={(event) => void approveRevision(event)} noValidate>
+                        <label className="block text-sm font-medium text-slate-800" htmlFor="reviewed-commit">
+                          Reviewed Git commit SHA
+                        </label>
+                        <p className="mt-1 text-sm text-slate-600" id="reviewed-commit-help">
+                          Enter the full 40-character SHA you reviewed for this repository and branch.
+                        </p>
+                        <div className="mt-2 flex flex-wrap items-start gap-2 sm:flex-nowrap">
+                          <input
+                            aria-describedby="reviewed-commit-help"
+                            autoCapitalize="none"
+                            autoComplete="off"
+                            className="form-input mt-0 min-w-0 font-mono"
+                            disabled={actionsBusy}
+                            id="reviewed-commit"
+                            onChange={(event) => setCommitInput(event.target.value)}
+                            spellCheck={false}
+                            value={commitInput}
+                          />
+                          <button className="button-secondary shrink-0" disabled={actionsBusy || !commitInput.trim()} type="submit">
+                            {pendingApproval === "approve" ? "Approving…" : approvedCommits.length > 0 ? "Approve another revision" : "Approve revision"}
+                          </button>
+                        </div>
+                      </form>
+                    )}
+                    <div>
+                      <label className="block text-sm font-medium text-slate-800" htmlFor="deployment-revision">
+                        Approved revisions
+                      </label>
+                      <select
+                        className="form-input font-mono"
+                        disabled={actionsBusy || approvedCommits.length === 0}
+                        id="deployment-revision"
+                        onChange={(event) => setSelectedCommit(event.target.value)}
+                        value={deploymentCommit}
+                      >
+                        <option value="">{approvedCommits.length ? "Select a deployment revision" : "No approved revisions available"}</option>
+                        {approvedCommits.map((commit) => <option key={commit} value={commit}>{commit}</option>)}
+                      </select>
+                    </div>
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      {deploymentActions}
+                      {canRevoke && (
+                        <button
+                          className="button-secondary text-red-700"
+                          disabled={actionsBusy}
+                          onClick={() => void revokeHosting()}
+                          type="button"
+                        >
+                          {pendingApproval === "revoke" ? "Withdrawing…" : approvalStatus === "WITHDRAWAL_PENDING" ? "Retry withdrawal" : "Revoke public hosting"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <h3 className="mt-5 text-base font-semibold tracking-tight text-slate-950">
                   Latest deployment attempt
                 </h3>
@@ -529,6 +697,9 @@ export default function ProjectDetailsPage() {
                       <StatusBadge status={latestDeployment.status} />
                       <p className="break-all font-mono text-xs text-slate-600">{latestDeployment.id}</p>
                     </div>
+                    {latestDeployment.errorMessage && (
+                      <p className="mt-4 text-sm text-red-700">{latestDeployment.errorMessage}</p>
+                    )}
 
                     <dl className="mt-5 grid gap-x-8 gap-y-5 sm:grid-cols-2">
                       <div>
@@ -637,7 +808,7 @@ export default function ProjectDetailsPage() {
                         autoCapitalize="none"
                         autoComplete="off"
                         className="form-input mt-0 font-mono"
-                        disabled={isSavingHealthCheck}
+                        disabled={actionsBusy}
                         maxLength={1024}
                         onChange={(event) =>
                           setHealthCheckPath(event.target.value)
@@ -647,7 +818,7 @@ export default function ProjectDetailsPage() {
                       <button
                         className="button-secondary mt-3"
                         disabled={
-                          isSavingHealthCheck ||
+                          actionsBusy ||
                           healthCheckPath.trim() === project.healthCheckPath
                         }
                         onClick={() => void saveHealthCheckPath()}
@@ -663,11 +834,9 @@ export default function ProjectDetailsPage() {
 
             {token !== null ? (
               <>
-                <GitHubWebhookPanel
-                  onUnauthorized={logout}
-                  projectId={project.id}
-                  token={token}
-                />
+                {!publicHosting && (
+                  <GitHubWebhookPanel onUnauthorized={logout} projectId={project.id} token={token} />
+                )}
                 <DeploymentMetricsPanel
                   deployment={selectedDeployment}
                   key={`${selectedDeployment?.id ?? "no-deployment"}:${selectedDeployment?.status ?? "none"}`}
@@ -768,7 +937,7 @@ export default function ProjectDetailsPage() {
                             deployment.commitHash !== null ? (
                               <button
                                 className="button-secondary"
-                                disabled={actionsBusy}
+                                disabled={!canRollback(deployment)}
                                 onClick={() => void runRollback(deployment)}
                                 type="button"
                               >

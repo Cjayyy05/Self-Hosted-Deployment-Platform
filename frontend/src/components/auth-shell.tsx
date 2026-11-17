@@ -7,7 +7,7 @@ type AuthShellProps = {
   description: string;
   footerPrompt: string;
   footerLabel: string;
-  footerHref: string;
+  footerHref?: string;
   children: ReactNode;
 };
 
@@ -45,15 +45,14 @@ export function AuthShell({
           </h1>
           <p className="mt-3 text-sm leading-6 text-slate-600">{description}</p>
           <div className="mt-8">{children}</div>
-          <p className="mt-8 text-center text-sm text-slate-600">
-            {footerPrompt}{" "}
-            <Link
-              className="font-semibold text-blue-700 hover:text-blue-800"
-              href={footerHref}
-            >
-              {footerLabel}
-            </Link>
-          </p>
+          {footerHref && (
+            <p className="mt-8 text-center text-sm text-slate-600">
+              {footerPrompt}{" "}
+              <Link className="font-semibold text-blue-700 hover:text-blue-800" href={footerHref}>
+                {footerLabel}
+              </Link>
+            </p>
+          )}
         </section>
       </div>
     </div>

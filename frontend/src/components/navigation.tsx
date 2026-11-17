@@ -9,7 +9,7 @@ import { useAuth } from "@/context/auth-context";
 export function Navigation() {
   const pathname = usePathname();
   const router = useRouter();
-  const { logout, status, user } = useAuth();
+  const { logout, registrationEnabled, status, user } = useAuth();
 
   const handleLogout = () => {
     logout();
@@ -63,12 +63,14 @@ export function Navigation() {
               >
                 Sign in
               </Link>
-              <Link
-                className="rounded-lg bg-slate-950 px-3.5 py-2 text-sm font-semibold text-white hover:bg-slate-800"
-                href="/register"
-              >
-                Get started
-              </Link>
+              {registrationEnabled && (
+                <Link
+                  className="rounded-lg bg-slate-950 px-3.5 py-2 text-sm font-semibold text-white hover:bg-slate-800"
+                  href="/register"
+                >
+                  Get started
+                </Link>
+              )}
             </>
           )}
         </div>
