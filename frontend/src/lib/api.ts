@@ -53,6 +53,8 @@ export type DeploymentStatus =
   | "STOPPED";
 
 export type HostingStatus =
+  | "VERIFYING_DNS"
+  | "DNS_UNVERIFIED"
   | "VERIFYING_HTTPS"
   | "DISABLED"
   | "AVAILABLE"

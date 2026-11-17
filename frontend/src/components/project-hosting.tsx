@@ -7,6 +7,8 @@ import type { HostingStatus, Project } from "@/lib/api";
 const statuses: Record<HostingStatus, { label: string; style: string }> = {
   DISABLED: { label: "Hosting disabled", style: "border-slate-200 bg-slate-100 text-slate-700" },
   AVAILABLE: { label: "Available", style: "border-emerald-200 bg-emerald-50 text-emerald-700" },
+  VERIFYING_DNS: { label: "Rechecking public DNS", style: "border-blue-200 bg-blue-50 text-blue-700" },
+  DNS_UNVERIFIED: { label: "Public DNS unverified", style: "border-amber-200 bg-amber-50 text-amber-800" },
   VERIFYING_HTTPS: { label: "Public HTTPS unverified", style: "border-amber-200 bg-amber-50 text-amber-800" },
   DEPLOYING: { label: "Deploying", style: "border-blue-200 bg-blue-50 text-blue-700" },
   UNAVAILABLE: { label: "Unavailable", style: "border-slate-200 bg-slate-100 text-slate-700" },
@@ -74,7 +76,7 @@ export function ProjectHosting({
   const isApproved = approvalStatus === "APPROVED";
   const applicationUrl = isPublic ? (isApproved ? publicApplicationUrl ?? null : null) : localApplicationUrl;
   const routeCanBeVerified = isPublic && isApproved && !isChangingRoute &&
-    certificateStatus === "READY" && hostingStatus === "AVAILABLE";
+    certificateStatus === "READY" && (hostingStatus === "AVAILABLE" || hostingStatus === "VERIFYING_DNS");
   const available = usePublicAvailability(
     publicApplicationUrl,
     routeCanBeVerified ? publicProbePath : undefined,
@@ -114,6 +116,12 @@ export function ProjectHosting({
       )}
       {project.hostingError && (
         <p className="text-sm text-red-700">{project.hostingError.message}</p>
+      )}
+      {status === "VERIFYING_DNS" && (
+        <p className="text-sm text-slate-600">The previous check passed. The DNS resolver is temporarily unable to confirm the hostname.</p>
+      )}
+      {status === "DNS_UNVERIFIED" && (
+        <p className="text-sm text-slate-600">Public reachability is unknown. DNS verification will continue automatically.</p>
       )}
       {applicationUrl !== null ? (
         <p className="break-all font-mono text-xs text-slate-700">{applicationUrl}</p>

@@ -25,13 +25,15 @@ export class PublicHostingReadinessError extends AppError {
 
 const resolver = new Resolver({ timeout: 1_500, tries: 1 });
 const dnsRetryDelaysMs = [1_000, 2_000, 4_000, 8_000, 10_000];
-const transientDnsCodes = new Set(['ETIMEOUT', 'ESERVFAIL', 'EREFUSED', 'ECONNREFUSED', 'EAI_AGAIN', 'ENODATA', 'ENOTFOUND']);
-const missingRecord = (error: unknown) =>
-  error instanceof Error && 'code' in error && error.code === 'ENODATA';
+const dashboardDnsRetryDelayMs = 250;
+const transientDnsCodes = new Set(['ETIMEOUT', 'ESERVFAIL', 'EREFUSED', 'ECONNREFUSED', 'EAI_AGAIN']);
+const missingDnsCodes = new Set(['ENODATA', 'ENOTFOUND']);
+const dnsErrorCode = (error: unknown) =>
+  error instanceof Error && 'code' in error && typeof error.code === 'string' ? error.code : '';
 type PublicDns = Record<'resolve4' | 'resolve6', (hostname: string) => Promise<string[]>>;
 
 class RetryableDnsError extends PublicHostingReadinessError {
-  constructor(public readonly reason: string) {
+  constructor(public readonly reason: string, public readonly transient: boolean) {
     super('DNS');
   }
 }
@@ -45,28 +47,42 @@ export class PublicHostingReadinessService {
   ) {}
 
   public async verifyDns(hostname: string): Promise<void> {
-    let answers: [string[], string[], string[]];
-    try {
-      answers = await Promise.all([
-        this.dns.resolve4(this.hosting.publicHosting?.dnsTarget ?? this.hosting.hostnameSuffix),
-        this.dns.resolve4(hostname),
-        this.dns.resolve6(hostname).catch((error: unknown) => {
-          if (!missingRecord(error)) throw error;
-          return [];
-        }),
-      ]);
-    } catch (error: unknown) {
-      if (error instanceof Error && 'code' in error && typeof error.code === 'string' && transientDnsCodes.has(error.code)) {
-        throw new RetryableDnsError(error.code);
+    const results = await Promise.allSettled([
+      this.dns.resolve4(this.hosting.publicHosting?.dnsTarget ?? this.hosting.hostnameSuffix),
+      this.dns.resolve4(hostname),
+      this.dns.resolve6(hostname).catch((error: unknown) => {
+        if (dnsErrorCode(error) === 'ENODATA') return [];
+        throw error;
+      }),
+    ]);
+    const [reference, addresses, ipv6] = results.map((result) => result.status === 'fulfilled' ? result.value : undefined);
+    if ((ipv6?.length ?? 0) > 0 || (reference?.length ?? 0) > 1 || new Set(addresses).size > 1 ||
+      (reference?.length === 1 && addresses?.some((ip) => ip !== reference[0]))) {
+      throw new PublicHostingReadinessError('DNS');
+    }
+    const errors = results.flatMap((result) => result.status === 'rejected' ? [dnsErrorCode(result.reason)] : []);
+    if (errors.some((code) => !missingDnsCodes.has(code) && !transientDnsCodes.has(code))) {
+      throw new PublicHostingReadinessError('DNS');
+    }
+    const missing = errors.find((code) => missingDnsCodes.has(code));
+    if (missing !== undefined) throw new RetryableDnsError(missing, false);
+    if (reference?.length === 0 || addresses?.length === 0) throw new RetryableDnsError('missing A answer', false);
+    if (errors[0] !== undefined) throw new RetryableDnsError(errors[0], true);
+  }
+
+  public async verifyDashboardDns(hostname: string): Promise<boolean> {
+    const check = async () => {
+      try {
+        await this.verifyDns(hostname);
+        return true;
+      } catch (error) {
+        if (error instanceof RetryableDnsError && error.transient) return false;
+        throw error;
       }
-      throw new PublicHostingReadinessError('DNS');
-    }
-    const [reference, addresses, ipv6] = answers;
-    if (ipv6.length > 0 || reference.length > 1 ||
-      (reference.length === 1 && addresses.some((ip) => ip !== reference[0]))) {
-      throw new PublicHostingReadinessError('DNS');
-    }
-    if (reference.length === 0 || addresses.length === 0) throw new RetryableDnsError('missing A answer');
+    };
+    if (await check()) return true;
+    await this.waitBeforeDnsRetry(dashboardDnsRetryDelayMs);
+    return check();
   }
 
   public async waitForDns(hostname: string, onProgress?: (message: string) => void): Promise<void> {

@@ -88,7 +88,7 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
     const databaseUrl = new URL(process.env.DEPLOYFLOW_PHASE5B_DB ?? '');
     expect(databaseUrl.hostname).toBe('127.0.0.1');
     expect(databaseUrl.port).toBe('55437');
-    expect(databaseUrl.pathname).toBe('/deployflow_phase5b');
+    expect(databaseUrl.pathname).toMatch(/^\/deployflow_phase5b(?:_[a-f0-9]{8})?$/);
     const certificate = process.env.NODE_EXTRA_CA_CERTS ?? '';
     const ca = await readFile(certificate, 'utf8');
     const key = join(certificate, '..', 'server.key');
@@ -181,6 +181,31 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       resolve6: () => Promise.resolve([]),
     });
     const failDnsOnce = temporaryDns.verifyDns.bind(temporaryDns);
+    let monitoringFault: 'none' | 'temporary' | 'persistent' | 'wrong-ipv4' | 'unexpected-ipv6' = 'none';
+    const lookups: string[] = [];
+    let rounds = 0;
+    const hostingStatusDns = new PublicHostingReadinessService(
+      { origin: 'https://' + suffix, hostnameSuffix: suffix, adminSocketPath: adminSocket },
+      {
+        resolve4: (name) => {
+          lookups.push('A ' + name);
+          if (monitoringFault === 'unexpected-ipv6' && name === suffix) {
+            return Promise.reject(Object.assign(new Error(), { code: 'ESERVFAIL' }));
+          }
+          return Promise.resolve([monitoringFault === 'wrong-ipv4' && name === host ? '192.0.2.20' : '192.0.2.10']);
+        },
+        resolve6: async (name) => {
+          lookups.push('AAAA ' + name);
+          rounds += 1;
+          await sleep(100);
+          if (monitoringFault === 'persistent' || (monitoringFault === 'temporary' && rounds === 1)) {
+            throw Object.assign(new Error(), { code: 'ESERVFAIL' });
+          }
+          return monitoringFault === 'unexpected-ipv6' ? ['2001:db8::1'] : [];
+        },
+      },
+    );
+    const verifyHostingStatusDns = hostingStatusDns.verifyDns.bind(hostingStatusDns);
     const dns = vi.spyOn(PublicHostingReadinessService.prototype, 'verifyDns').mockResolvedValue();
 
     try {
@@ -256,6 +281,55 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       const firstProbe = summary.project.publicProbePath;
       expect(await https(firstProbe, host, ca)).toMatchObject({ status: 204, body: '', cors: 'http://127.0.0.1:3000' });
       expect((await https(firstProbe + 'wrong', host, ca)).status).toBe(404);
+
+      step = 'live dashboard polling during DNS failures';
+      dns.mockImplementation((hostname) => hostname === host ? verifyHostingStatusDns(hostname) : Promise.resolve());
+      const resetLookups = (fault: typeof monitoringFault) => {
+        monitoringFault = fault;
+        lookups.length = 0;
+        rounds = 0;
+      };
+      const expectLookups = (attempts: number) => {
+        expect(lookups).toEqual(Array.from({ length: attempts }, () => ['A ' + suffix, 'A ' + host, 'AAAA ' + host]).flat());
+      };
+      resetLookups('temporary');
+      const recovered = await status().expect(200);
+      expect(recovered.body).toMatchObject({ project: { hostingStatus: 'AVAILABLE', publicProbePath: firstProbe } });
+      expectLookups(2);
+
+      resetLookups('persistent');
+      const requests = Array.from({ length: 6 }, () => status().expect(200));
+      const list = api.get('/api/projects').set('Authorization', auth).expect(200);
+      for (const result of await Promise.all([...requests, list])) {
+        const body = result.body as { project?: unknown; projects?: { id: string }[] };
+        expect(body.project ?? body.projects?.find(({ id }) => id === projectId))
+          .toMatchObject({ hostingStatus: 'VERIFYING_DNS', publicProbePath: firstProbe });
+      }
+      expectLookups(2);
+      expect((await status().expect(200)).body).toMatchObject({ project: { hostingStatus: 'VERIFYING_DNS' } });
+      const persistent = await status().expect(200);
+      expect(persistent.body).toMatchObject({ project: { hostingStatus: 'DNS_UNVERIFIED', approvalStatus: 'APPROVED' } });
+      expect(persistent.body).not.toHaveProperty('project.publicProbePath');
+      expectLookups(6);
+      expect(await https('/', host, ca)).toMatchObject({ status: 200, body: 'v1', san: 'DNS:' + host });
+
+      resetLookups('none');
+      expect((await status().expect(200)).body).toMatchObject({ project: { hostingStatus: 'AVAILABLE', publicProbePath: firstProbe } });
+      expectLookups(1);
+      for (const fault of ['wrong-ipv4', 'unexpected-ipv6'] as const) {
+        resetLookups(fault);
+        const invalid = await status().expect(200);
+        expect(invalid.body).toMatchObject({ project: { hostingStatus: 'RECOVERING', hostingError: { code: 'DNS' } } });
+        expect(invalid.body).not.toHaveProperty('project.publicProbePath');
+        expectLookups(1);
+        resetLookups('persistent');
+        expect((await status().expect(200)).body).toMatchObject({ project: { hostingStatus: 'DNS_UNVERIFIED' } });
+        expectLookups(2);
+        resetLookups('none');
+        expect((await status().expect(200)).body).toMatchObject({ project: { hostingStatus: 'AVAILABLE' } });
+      }
+      dns.mockResolvedValue();
+
       await api.put('/api/projects/' + otherId + '/public-approval').set('Authorization', auth)
         .send({ repositoryUrl: otherRepositoryUrl, branch: 'main', commitHash: otherCommit }).expect(200);
       const other = await api.post('/api/projects/' + otherId + '/deploy').set('Authorization', auth)

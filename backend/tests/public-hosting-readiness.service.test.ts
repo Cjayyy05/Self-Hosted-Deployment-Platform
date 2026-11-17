@@ -49,6 +49,45 @@ describe('public hosting readiness', () => {
     ]);
   });
 
+  it('bounds the dashboard DNS check at two attempts and retries only temporary resolver errors', async () => {
+    const dns = {
+      resolve4: vi.fn<(name: string) => Promise<string[]>>().mockResolvedValue(['192.0.2.10']),
+      resolve6: vi.fn<(name: string) => Promise<string[]>>().mockResolvedValue([]),
+    };
+    const wait = vi.fn().mockResolvedValue(undefined);
+    const readiness = new PublicHostingReadinessService(hosting, dns, undefined, wait);
+    const failure = Object.assign(new Error(), { code: 'ESERVFAIL' });
+    dns.resolve6.mockRejectedValueOnce(failure);
+    await expect(readiness.verifyDashboardDns(hostname)).resolves.toBe(true);
+    dns.resolve6.mockRejectedValue(failure);
+    await expect(readiness.verifyDashboardDns(hostname)).resolves.toBe(false);
+    expect(wait.mock.calls).toEqual([[250], [250]]);
+    expect(dns.resolve4).toHaveBeenCalledTimes(8);
+    expect(dns.resolve6).toHaveBeenCalledTimes(4);
+  });
+
+  it.each([
+    { reference: ['192.0.2.10'], addresses: ['192.0.2.11'], ipv6Error: 'ESERVFAIL' },
+    { referenceError: 'ETIMEOUT', addresses: ['192.0.2.10', '192.0.2.11'] },
+    { referenceError: 'ETIMEOUT', addresses: ['192.0.2.10'], ipv6: ['2001:db8::1'] },
+    { referenceError: 'ETIMEOUT', addressError: 'ENOTFOUND' },
+    { reference: ['192.0.2.10'], addressError: 'ENODATA' },
+    { reference: ['192.0.2.10'], addresses: [] },
+  ])('never classifies known invalid or missing records as dashboard uncertainty: %j',
+    async ({ reference, referenceError, addresses, addressError, ipv6, ipv6Error }) => {
+      const answer = (values: string[] | undefined, code: string | undefined) =>
+        code === undefined ? Promise.resolve(values ?? []) : Promise.reject(Object.assign(new Error(), { code }));
+      const dns = {
+        resolve4: vi.fn((name: string) => name === hostname ? answer(addresses, addressError) : answer(reference, referenceError)),
+        resolve6: vi.fn(() => answer(ipv6, ipv6Error)),
+      };
+      const wait = vi.fn().mockResolvedValue(undefined);
+      const readiness = new PublicHostingReadinessService(hosting, dns, undefined, wait);
+      await expect(readiness.verifyDashboardDns(hostname)).rejects.toMatchObject({ code: 'DNS' });
+      expect(wait).not.toHaveBeenCalled();
+    },
+  );
+
   it('stops after six attempts when an A answer stays missing', async () => {
     const dns = { resolve4: vi.fn().mockResolvedValue([]), resolve6: vi.fn().mockResolvedValue([]) };
     const wait = vi.fn().mockResolvedValue(undefined);

@@ -6,7 +6,8 @@ import { PublicHostingReadinessError } from '../src/services/public-hosting-read
 const hostnameLabel = 'app-11111111111141118111111111111111';
 const hostname = hostnameLabel + '.localhost';
 const hosting = { origin: 'http://localhost:18083', hostnameSuffix: 'localhost', adminSocketPath: undefined };
-const active = { status: 'RUNNING', hostPort: 51001, publicAddressIndex: null, commitHash: 'a'.repeat(40) } as const;
+const active = { id: '33333333-3333-4333-8333-333333333333', status: 'RUNNING', hostPort: 51001,
+  publicAddressIndex: null, commitHash: 'a'.repeat(40) } as const;
 const project = {
   id: '11111111-1111-4111-8111-111111111111',
   userId: '22222222-2222-4222-8222-222222222222',
@@ -24,6 +25,24 @@ const setup = () => {
   const routes = { readDashboardTargets: vi.fn<() => Promise<ReadonlyMap<string, { address: string; port: number }>>>().mockResolvedValue(route) };
   const health = { waitUntilHealthy: vi.fn<() => Promise<void>>().mockResolvedValue(undefined) };
   return { ...routes, ...health, service: new ProjectHostingService(routes, hosting, health) };
+};
+
+const publicHostname = hostnameLabel + '.apps.example.net';
+const publicTarget = { address: '127.64.0.1', port: 787 };
+const publicProject = { ...project, activeDeployment: { ...active, publicAddressIndex: 1, hostPort: publicTarget.port } };
+const publicApproval = { revokedAt: null, commits: [active.commitHash] };
+
+const setupPublic = () => {
+  const readDashboardTargets = vi.fn().mockResolvedValue(new Map([[publicHostname, publicTarget]]));
+  const readiness = { verifyDashboardDns: vi.fn<() => Promise<boolean>>().mockResolvedValue(true),
+    verifyHttps: vi.fn().mockResolvedValue(undefined) };
+  const read = vi.fn().mockResolvedValue(publicApproval);
+  const now = vi.fn().mockReturnValue(0);
+  const service = new ProjectHostingService({ readDashboardTargets }, {
+    origin: 'https://apps.example.net', hostnameSuffix: 'apps.example.net', adminSocketPath: '/run/caddy/admin.sock',
+    publicHosting: { operatorId: project.userId },
+  }, undefined, { read }, readiness, now);
+  return { service, readDashboardTargets, readiness, read, now };
 };
 
 describe('project hosting status', () => {
@@ -85,38 +104,102 @@ describe('project hosting status', () => {
   });
 
   it('returns a route-specific browser check only after approval, DNS and HTTPS checks', async () => {
-    const publicHostname = hostnameLabel + '.apps.example.net';
-    const routes = { readDashboardTargets: vi.fn().mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.1', port: 787 }]])) };
-    const readiness = { verifyDns: vi.fn().mockResolvedValue(undefined), verifyHttps: vi.fn().mockResolvedValue(undefined) };
-    const policy = { read: vi.fn().mockResolvedValue({ revokedAt: null, commits: [active.commitHash] }) };
-    const service = new ProjectHostingService(routes, {
-      origin: 'https://apps.example.net', hostnameSuffix: 'apps.example.net', adminSocketPath: '/run/caddy/admin.sock',
-      publicHosting: { operatorId: project.userId },
-    }, undefined, policy, readiness);
-    const publicProject = { ...project, activeDeployment: { ...active, publicAddressIndex: 1, hostPort: 787 } };
+    const { service, readDashboardTargets, readiness, read } = setupPublic();
     const verified = await service.summarize(publicProject);
     expect(verified).toMatchObject({
       localApplicationUrl: null, publicHostname, publicApplicationUrl: 'https://' + publicHostname,
       hostingStatus: 'AVAILABLE', certificateStatus: 'READY', approvalStatus: 'APPROVED',
     });
     expect(verified.publicProbePath).toMatch(/^\/\.well-known\/deployflow-health\/[a-f0-9]{64}$/);
-    expect(readiness.verifyDns).toHaveBeenCalledWith(publicHostname);
+    expect(readiness.verifyDashboardDns).toHaveBeenCalledWith(publicHostname);
     expect(readiness.verifyHttps).toHaveBeenCalledWith(new URL('https://' + publicHostname), verified.publicProbePath);
     await expect(service.summarize({ ...publicProject, routingOperation: 'STOP' }))
       .resolves.toMatchObject({ hostingStatus: 'RECOVERING', certificateStatus: 'UNVERIFIED' });
-    policy.read.mockResolvedValueOnce(null);
+    read.mockResolvedValueOnce(null);
     await expect(service.summarize(publicProject)).resolves.toMatchObject({ publicHostname, hostingStatus: 'UNAVAILABLE', approvalStatus: 'UNAPPROVED' });
     const replacement = { ...publicProject, activeDeployment: { ...publicProject.activeDeployment, publicAddressIndex: 2 } };
     await expect(service.summarize(replacement)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
-    routes.readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.2', port: 787 }]]));
+    readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.2', port: 787 }]]));
     const updated = await service.summarize(replacement);
     expect(updated.hostingStatus).toBe('AVAILABLE');
     expect(updated.publicProbePath).not.toBe(verified.publicProbePath);
-    routes.readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.1', port: 787 }]]));
+    readDashboardTargets.mockResolvedValue(new Map([[publicHostname, publicTarget]]));
     readiness.verifyHttps.mockRejectedValueOnce(new PublicHostingReadinessError('CERTIFICATE'));
     const unverified = await service.summarize(publicProject);
     expect(unverified.hostingStatus).toBe('RECOVERING');
     expect(unverified.hostingError?.code).toBe('CERTIFICATE');
     expect(unverified.publicProbePath).toBeUndefined();
+  });
+
+  it('shares an in-flight verification and escalates only after three failed transient rounds', async () => {
+    const { service, readiness } = setupPublic();
+    const verified = await service.summarize(publicProject);
+    readiness.verifyDashboardDns.mockResolvedValue(false);
+    const concurrent = await Promise.all(Array.from({ length: 3 }, () => service.summarize(publicProject)));
+    for (const summary of concurrent) {
+      expect(summary).toMatchObject({ hostingStatus: 'VERIFYING_DNS', publicProbePath: verified.publicProbePath });
+    }
+    expect(readiness.verifyDashboardDns).toHaveBeenCalledTimes(2);
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'VERIFYING_DNS' });
+    const unverified = await service.summarize(publicProject);
+    expect(unverified.hostingStatus).toBe('DNS_UNVERIFIED');
+    expect(unverified.publicProbePath).toBeUndefined();
+    readiness.verifyDashboardDns.mockResolvedValueOnce(true);
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'AVAILABLE' });
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'VERIFYING_DNS' });
+  });
+
+  it('requires an unexpired verification for this deployment and health path', async () => {
+    const { service, readiness, now } = setupPublic();
+    readiness.verifyDashboardDns.mockResolvedValue(false);
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+    readiness.verifyDashboardDns.mockResolvedValueOnce(true);
+    await service.summarize(publicProject);
+    now.mockReturnValue(20_000);
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+    readiness.verifyDashboardDns.mockResolvedValueOnce(true);
+    await service.summarize(publicProject);
+    await expect(service.summarize({ ...publicProject, healthCheckPath: '/changed' }))
+      .resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+    readiness.verifyDashboardDns.mockResolvedValueOnce(true);
+    await service.summarize(publicProject);
+    await expect(service.summarize({ ...publicProject, activeDeployment: { ...publicProject.activeDeployment, id: 'replacement' } }))
+      .resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+  });
+
+  it.each(['DNS', 'APPLICATION', 'CERTIFICATE', 'ROUTING'] as const)(
+    'reports a confirmed %s failure immediately and clears the previous verification',
+    async (code) => {
+      const { service, readiness } = setupPublic();
+      await service.summarize(publicProject);
+      readiness.verifyDashboardDns.mockResolvedValue(false);
+      const check = code === 'DNS' ? readiness.verifyDashboardDns : readiness.verifyHttps;
+      check.mockRejectedValueOnce(new PublicHostingReadinessError(code));
+      const failure = await service.summarize(publicProject);
+      expect(failure).toMatchObject({ hostingStatus: 'RECOVERING', hostingError: { code } });
+      expect(failure.publicProbePath).toBeUndefined();
+      await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+    },
+  );
+
+  it('withdraws dashboard verification immediately on a route change or loss of approval', async () => {
+    const { service, readiness, read, readDashboardTargets } = setupPublic();
+    await service.summarize(publicProject);
+    readiness.verifyDashboardDns.mockResolvedValue(false);
+    readDashboardTargets.mockResolvedValueOnce(new Map([[publicHostname, publicTarget]])).mockResolvedValueOnce(new Map());
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingError: { code: 'ROUTING' } });
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+    readiness.verifyDashboardDns.mockResolvedValueOnce(true);
+    await service.summarize(publicProject);
+    read.mockResolvedValueOnce(publicApproval).mockResolvedValueOnce({ revokedAt: new Date(), withdrawnAt: null });
+    const revoked = await service.summarize(publicProject);
+    expect(revoked).toMatchObject({ hostingStatus: 'UNAVAILABLE', approvalStatus: 'WITHDRAWAL_PENDING' });
+    expect(revoked.publicApplicationUrl).toBeUndefined();
+    expect(revoked.publicProbePath).toBeUndefined();
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ hostingStatus: 'DNS_UNVERIFIED' });
+    read.mockResolvedValueOnce({ ...publicApproval, commits: [] });
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({
+      hostingStatus: 'UNAVAILABLE', hostingError: { code: 'APPROVAL' },
+    });
   });
 });
