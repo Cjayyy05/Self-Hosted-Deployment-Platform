@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 
 import { database } from '../config/database.js';
 import { buildNetworkService } from './build-network.service.js';
-import { env, managesProjectRoute } from '../config/env.js';
+import { env } from '../config/env.js';
 import type { Prisma } from '../generated/prisma/client.js';
 import { AppError } from '../utils/app-error.js';
 import { projectHostnameLabel } from '../utils/project-hostname.js';
@@ -35,7 +35,7 @@ const projectSelect = {
   updatedAt: true,
 } as const;
 
-const deploymentSummary = { id: true, status: true, commitHash: true, createdAt: true } as const;
+const deploymentSummary = { id: true, status: true, commitHash: true, createdAt: true, errorMessage: true } as const;
 const projectHostingSelect = {
   ...projectSelect,
   activeDeployment: { select: { ...deploymentSummary, hostPort: true, publicAddressIndex: true } },
@@ -104,6 +104,13 @@ export const getProject = async (userId: string, projectId: string) => {
   }
 
   return withHosting(project);
+};
+
+export const getPublicDeploymentHosting = async (userId: string, projectId: string) => {
+  if (env.hosting.publicHosting === undefined) return {};
+  const { publicHostname, publicApplicationUrl, publicProbePath, hostingStatus, approvalStatus, certificateStatus, hostingError } =
+    await getProject(userId, projectId);
+  return { hosting: { publicHostname, publicApplicationUrl, publicProbePath, hostingStatus, approvalStatus, certificateStatus, hostingError } };
 };
 
 export const updateProjectHealthCheck = async (
@@ -199,7 +206,7 @@ export const deleteProject = async (
   await projectOperationLockService.runExclusive(projectId, async (lease) => {
     const publicLease = env.hosting.publicHosting === undefined ? undefined : requireRoutingLease(lease);
     if (publicLease !== undefined) await assertNoPendingPublicWithdrawal(projectId);
-    const routing = managesProjectRoute(env.hosting, projectId) ? deploymentRoutingService : undefined;
+    const routing = deploymentRoutingService;
     const hosted = routing === undefined ? undefined : requireRoutingLease(lease);
     const deletion = routing === undefined || hosted === undefined
       ? null

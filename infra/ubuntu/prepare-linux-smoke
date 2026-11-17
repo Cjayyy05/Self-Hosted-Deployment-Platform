@@ -14,8 +14,8 @@ export DEPLOYFLOW_PHASE5B_SMOKE=1
 export DEPLOYFLOW_PHASE5B_DB=postgresql://deployflow_fixture:phase5b-disposable-only@127.0.0.1:55437/deployflow_phase5b
 export NODE_EXTRA_CA_CERTS=/var/tmp/deployflow-phase5b/server.crt
 openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
-    -subj /CN=app-11111111111141118111111111111111.apps.example.net \
-    -addext subjectAltName=DNS:app-11111111111141118111111111111111.apps.example.net \
+    -subj '/CN=DeployFlow Disposable Test CA' -addext basicConstraints=critical,CA:TRUE \
+    -addext keyUsage=critical,keyCertSign,cRLSign \
     -keyout /var/tmp/deployflow-phase5b/server.key -out "$NODE_EXTRA_CA_CERTS" 2>/dev/null
 
 systemctl start deployflow-build.slice

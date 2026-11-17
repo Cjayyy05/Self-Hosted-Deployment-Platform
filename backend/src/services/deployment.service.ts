@@ -1,5 +1,5 @@
 import { database } from '../config/database.js';
-import { env, managesProjectRoute, type HostingConfig } from '../config/env.js';
+import { env, type HostingConfig } from '../config/env.js';
 import {
   DeploymentStatus,
   type DeploymentStatus as DeploymentStatusValue,
@@ -305,12 +305,8 @@ export class DeploymentService {
     this.#now = dependencies.now ?? (() => new Date());
   }
 
-  #projectRouting(projectId: string) {
-    return managesProjectRoute(this.#hosting, projectId) ? this.#routing : undefined;
-  }
-
-  #workloadLease(projectId: string, lease: ProjectOperationLease | undefined) {
-    return this.#hosting.publicHosting !== undefined || this.#projectRouting(projectId) !== undefined
+  #workloadLease(lease: ProjectOperationLease | undefined) {
+    return this.#hosting.publicHosting !== undefined || this.#routing !== undefined
       ? requireRoutingLease(lease) : undefined;
   }
 
@@ -347,7 +343,7 @@ export class DeploymentService {
         });
         if (result.count !== 1) throw new AppError(409, 'Deployment startup is no longer current');
       });
-      await this.#projectRouting(project.id)?.assertPublicPortOwned();
+      await this.#routing?.assertPublicPortOwned(project.id);
       await this.#assertWorkloadAllowed(project, commitHash);
       await held.assertValid();
     });
@@ -430,8 +426,8 @@ export class DeploymentService {
     onEvent: DeploymentEventCallback | undefined,
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
-    const routing = this.#projectRouting(deployment.projectId);
-    const hostingLease = this.#workloadLease(deployment.projectId, lease);
+    const routing = this.#routing;
+    const hostingLease = this.#workloadLease(lease);
     await this.#assertWorkloadAllowed(deployment.project, deployment.commitHash);
     if (this.#hosting.publicHosting !== undefined && deployment.publicAddressIndex == null) {
       throw new AppError(409, 'Deploy an approved revision to replace this legacy container');
@@ -451,7 +447,7 @@ export class DeploymentService {
         deploymentId: deployment.id,
         status: DeploymentStatus.STARTING,
       });
-      if (this.#hosting.publicHosting !== undefined) await routing?.assertPublicPortOwned();
+      if (this.#hosting.publicHosting !== undefined) await routing?.assertPublicPortOwned(deployment.projectId);
       await this.#assertWorkloadAllowed(deployment.project, deployment.commitHash);
       await hostingLease?.assertValid();
       const restartedContainer = await this.#containerService.restartContainer(
@@ -541,8 +537,7 @@ export class DeploymentService {
         // Preserve the restart failure when its status cannot also be persisted.
       }
 
-      const statusCode = error instanceof AppError ? error.statusCode : 500;
-      throw new AppError(statusCode, errorMessage);
+      throw error instanceof AppError ? error : new AppError(500, errorMessage);
     }
   }
 
@@ -613,8 +608,8 @@ export class DeploymentService {
   ): Promise<DeploymentRecord> {
     const newDeployment = await this.#deployProjectUnlocked(projectId, onEvent, lease, commitHash);
 
-    if (this.#projectRouting(projectId) === undefined) {
-      await this.#workloadLease(projectId, lease)?.assertValid();
+    if (this.#routing === undefined) {
+      await this.#workloadLease(lease)?.assertValid();
       await this.#stopPreviousRunningDeployments(projectId, newDeployment.id, onEvent);
     }
 
@@ -628,8 +623,8 @@ export class DeploymentService {
   ): Promise<DeploymentRecord> {
     if (this.#hosting.publicHosting !== undefined) await assertNoPendingPublicWithdrawal(deployment.projectId);
     const containerId = this.#requireContainerId(deployment);
-    const routing = this.#projectRouting(deployment.projectId);
-    const hostingLease = this.#workloadLease(deployment.projectId, lease);
+    const routing = this.#routing;
+    const hostingLease = this.#workloadLease(lease);
 
     try {
       if (routing !== undefined) {
@@ -701,8 +696,8 @@ export class DeploymentService {
     lease?: ProjectOperationLease,
     requestedCommit?: string,
   ): Promise<DeploymentRecord> {
-    const routing = this.#projectRouting(projectId);
-    const hostingLease = this.#workloadLease(projectId, lease);
+    const routing = this.#routing;
+    const hostingLease = this.#workloadLease(lease);
     if (routing !== undefined) await routing.assertIdle(projectId, requireRoutingLease(lease));
     let project: DeploymentProject | null;
 
@@ -875,8 +870,7 @@ export class DeploymentService {
         errorMessage,
       });
 
-      const statusCode = error instanceof AppError ? error.statusCode : 422;
-      throw new AppError(statusCode, errorMessage);
+      throw error instanceof AppError ? error : new AppError(422, errorMessage);
     }
   }
 
@@ -886,8 +880,8 @@ export class DeploymentService {
     lease: ProjectOperationLease | undefined,
   ): Promise<DeploymentRecord> {
     const project = sourceDeployment.project;
-    const routing = this.#projectRouting(sourceDeployment.projectId);
-    const hostingLease = this.#workloadLease(sourceDeployment.projectId, lease);
+    const routing = this.#routing;
+    const hostingLease = this.#workloadLease(lease);
     await this.#assertWorkloadAllowed(project, sourceDeployment.commitHash);
     if (routing !== undefined) await routing.assertIdle(sourceDeployment.projectId, requireRoutingLease(lease));
     const commitHash = sourceDeployment.commitHash;
@@ -1093,8 +1087,7 @@ export class DeploymentService {
         errorMessage,
       });
 
-      const statusCode = error instanceof AppError ? error.statusCode : 422;
-      throw new AppError(statusCode, errorMessage);
+      throw error instanceof AppError ? error : new AppError(422, errorMessage);
     }
 
     if (routing === undefined) {

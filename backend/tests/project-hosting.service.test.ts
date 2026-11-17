@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { ProjectHostingService } from '../src/services/project-hosting.service.js';
+import { PublicHostingReadinessError } from '../src/services/public-hosting-readiness.service.js';
 
 const hostnameLabel = 'app-11111111111141118111111111111111';
 const hostname = hostnameLabel + '.localhost';
@@ -83,35 +84,39 @@ describe('project hosting status', () => {
     await expect(service.summarize(project)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
   });
 
-  it('returns a route-specific browser check after verified local TLS and rejects other projects', async () => {
+  it('returns a route-specific browser check only after approval, DNS and HTTPS checks', async () => {
     const publicHostname = hostnameLabel + '.apps.example.net';
     const routes = { readDashboardTargets: vi.fn().mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.1', port: 787 }]])) };
-    const health = { waitUntilHealthy: vi.fn().mockResolvedValue(undefined) };
+    const readiness = { verifyDns: vi.fn().mockResolvedValue(undefined), verifyHttps: vi.fn().mockResolvedValue(undefined) };
+    const policy = { read: vi.fn().mockResolvedValue({ revokedAt: null, commits: [active.commitHash] }) };
     const service = new ProjectHostingService(routes, {
       origin: 'https://apps.example.net', hostnameSuffix: 'apps.example.net', adminSocketPath: '/run/caddy/admin.sock',
-      publicHosting: { operatorId: project.userId, routeProjectId: project.id },
-    }, health, { assertApproved: vi.fn().mockResolvedValue(undefined) });
+      publicHosting: { operatorId: project.userId },
+    }, undefined, policy, readiness);
     const publicProject = { ...project, activeDeployment: { ...active, publicAddressIndex: 1, hostPort: 787 } };
     const verified = await service.summarize(publicProject);
     expect(verified).toMatchObject({
-      localApplicationUrl: null, publicApplicationUrl: 'https://' + publicHostname, hostingStatus: 'VERIFYING_HTTPS',
+      localApplicationUrl: null, publicHostname, publicApplicationUrl: 'https://' + publicHostname,
+      hostingStatus: 'AVAILABLE', certificateStatus: 'READY', approvalStatus: 'APPROVED',
     });
     expect(verified.publicProbePath).toMatch(/^\/\.well-known\/deployflow-health\/[a-f0-9]{64}$/);
-    expect(health.waitUntilHealthy).toHaveBeenCalledWith({
-      hostPort: 443, hostname: publicHostname, path: verified.publicProbePath, https: true,
-    });
-    await expect(service.summarize({ ...project, id: project.userId }))
-      .resolves.toEqual({ localApplicationUrl: null, hostingStatus: 'DISABLED' });
+    expect(readiness.verifyDns).toHaveBeenCalledWith(publicHostname);
+    expect(readiness.verifyHttps).toHaveBeenCalledWith(new URL('https://' + publicHostname), verified.publicProbePath);
+    await expect(service.summarize({ ...publicProject, routingOperation: 'STOP' }))
+      .resolves.toMatchObject({ hostingStatus: 'RECOVERING', certificateStatus: 'UNVERIFIED' });
+    policy.read.mockResolvedValueOnce(null);
+    await expect(service.summarize(publicProject)).resolves.toMatchObject({ publicHostname, hostingStatus: 'UNAVAILABLE', approvalStatus: 'UNAPPROVED' });
     const replacement = { ...publicProject, activeDeployment: { ...publicProject.activeDeployment, publicAddressIndex: 2 } };
     await expect(service.summarize(replacement)).resolves.toMatchObject({ hostingStatus: 'RECOVERING' });
     routes.readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.2', port: 787 }]]));
     const updated = await service.summarize(replacement);
-    expect(updated.hostingStatus).toBe('VERIFYING_HTTPS');
+    expect(updated.hostingStatus).toBe('AVAILABLE');
     expect(updated.publicProbePath).not.toBe(verified.publicProbePath);
     routes.readDashboardTargets.mockResolvedValue(new Map([[publicHostname, { address: '127.64.0.1', port: 787 }]]));
-    health.waitUntilHealthy.mockRejectedValueOnce(new Error('certificate invalid'));
+    readiness.verifyHttps.mockRejectedValueOnce(new PublicHostingReadinessError('CERTIFICATE'));
     const unverified = await service.summarize(publicProject);
     expect(unverified.hostingStatus).toBe('RECOVERING');
+    expect(unverified.hostingError?.code).toBe('CERTIFICATE');
     expect(unverified.publicProbePath).toBeUndefined();
   });
 });

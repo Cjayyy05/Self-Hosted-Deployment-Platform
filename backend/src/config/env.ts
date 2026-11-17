@@ -139,12 +139,9 @@ export type HostingConfig = Readonly<{
   origin: string;
   hostnameSuffix: string;
   adminSocketPath: string | undefined;
-  publicHosting?: Readonly<{ operatorId: string; routeProjectId?: string; ingressSocketPath?: string }>;
+  publicHosting?: Readonly<{ operatorId: string; legacyProjectId?: string; ingressSocketPath?: string; dnsTarget?: string }>;
   publicApp?: PublicApplication;
 }>;
-
-export const managesProjectRoute = (hosting: HostingConfig, projectId: string): boolean =>
-  hosting.publicHosting === undefined || hosting.publicHosting.routeProjectId === projectId;
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
@@ -203,6 +200,7 @@ export const parseHostingConfig = (
     publicHostingEnabled?: boolean | undefined;
     publicOperatorId?: string | undefined;
     publicIngressSocket?: string | undefined;
+    publicDnsTarget?: string | undefined;
     publicProjectId?: string | undefined;
     publicRepositoryUrl?: string | undefined;
     publicBranch?: string | undefined;
@@ -220,11 +218,11 @@ export const parseHostingConfig = (
     throw new Error('APP_HOSTNAME_SUFFIX must be a DNS suffix that fits after a project label');
   }
   const socket = input.adminSocketPath?.trim();
-  const routeProjectId = input.publicProjectId?.toLowerCase();
-  if (routeProjectId !== undefined && !UUID_PATTERN.test(routeProjectId)) {
+  const legacyProjectId = input.publicProjectId?.toLowerCase();
+  if (legacyProjectId !== undefined && !UUID_PATTERN.test(legacyProjectId)) {
     throw new Error('APP_PUBLIC_PROJECT_ID must be a project UUID');
   }
-  const publicApp = parsePublicApplication({ projectId: routeProjectId,
+  const publicApp = parsePublicApplication({ projectId: legacyProjectId,
     repositoryUrl: input.publicRepositoryUrl, branch: input.publicBranch, commits: input.publicCommits });
   const publicEnabled = input.publicHostingEnabled ?? publicApp !== undefined;
   if (publicEnabled) {
@@ -237,6 +235,11 @@ export const parseHostingConfig = (
       throw new Error('Public hosting requires Linux, a private Caddy socket, and an HTTPS origin matching APP_HOSTNAME_SUFFIX');
     }
     const adminSocketPath = parseCaddyAdminSocketPath(socket, platform);
+    const dnsTarget = input.publicDnsTarget?.trim().toLowerCase() ?? hostnameSuffix;
+    if (dnsTarget.length > 253 || !dnsTarget.includes('.') || isIP(dnsTarget) !== 0 ||
+      !dnsTarget.split('.').every((label) => DNS_LABEL.test(label))) {
+      throw new Error('APP_PUBLIC_DNS_TARGET must be the hostname whose A record points to the public server');
+    }
     const ingressSocketPath = input.publicIngressSocket === undefined ? undefined
       : parseCaddyAdminSocketPath(input.publicIngressSocket, platform);
     if (adminSocketPath === (ingressSocketPath ?? '/run/deployflow-ingress/auth.sock')) {
@@ -244,12 +247,13 @@ export const parseHostingConfig = (
     }
     return Object.freeze({
       origin, hostnameSuffix, adminSocketPath,
-      publicHosting: Object.freeze({ operatorId, ...(routeProjectId === undefined ? {} : { routeProjectId }),
+      publicHosting: Object.freeze({ operatorId, dnsTarget, ...(legacyProjectId === undefined ? {} : { legacyProjectId }),
         ...(ingressSocketPath === undefined ? {} : { ingressSocketPath }) }),
       ...(publicApp === undefined ? {} : { publicApp }),
     });
   }
-  if (routeProjectId !== undefined || input.publicOperatorId !== undefined || input.publicIngressSocket !== undefined || publicApp !== undefined) {
+  if (legacyProjectId !== undefined || input.publicOperatorId !== undefined || input.publicIngressSocket !== undefined ||
+    input.publicDnsTarget !== undefined || publicApp !== undefined) {
     throw new Error('Public hosting settings require APP_PUBLIC_HOSTING_ENABLED=true or a complete legacy approval');
   }
   const match = /^http:\/\/(localhost|127\.0\.0\.1)(?::([1-9]\d{0,4}))?\/?$/.exec(origin);
@@ -276,6 +280,7 @@ export const env = Object.freeze({
       parseBoolean('APP_PUBLIC_HOSTING_ENABLED', process.env.APP_PUBLIC_HOSTING_ENABLED, false),
     publicOperatorId: process.env.APP_PUBLIC_OPERATOR_ID,
     publicIngressSocket: process.env.APP_PUBLIC_INGRESS_SOCKET,
+    publicDnsTarget: process.env.APP_PUBLIC_DNS_TARGET,
     publicProjectId: process.env.APP_PUBLIC_PROJECT_ID,
     publicRepositoryUrl: process.env.APP_PUBLIC_REPOSITORY_URL,
     publicBranch: process.env.APP_PUBLIC_BRANCH,

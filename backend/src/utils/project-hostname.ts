@@ -9,6 +9,12 @@ export const projectHostnameLabel = (id: string): string => {
   return `app-${id.toLowerCase().replaceAll('-', '')}`;
 };
 
+export const projectIdFromHostname = (hostname: string, suffix: string): string | undefined => {
+  if (!hostname.endsWith('.' + suffix)) return undefined;
+  return /^app-([a-f0-9]{8})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{4})([a-f0-9]{12})$/
+    .exec(hostname.slice(0, -(suffix.length + 1)))?.slice(1).join('-');
+};
+
 export const localProjectUrl = (
   label: string,
   hosting: { origin: string; hostnameSuffix: string },

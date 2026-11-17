@@ -78,6 +78,7 @@ function harness(previous = true) {
   };
   const routes = {
     readPort, upsert: vi.fn(write), repair: vi.fn(write),
+    readDashboardTargets: () => Promise.resolve(new Map()),
     readTarget: () => Promise.resolve(route === null ? null : { address: '127.0.0.1', port: route }),
     remove: vi.fn((id: string, options?: Options) => write(id, undefined, options)),
   };

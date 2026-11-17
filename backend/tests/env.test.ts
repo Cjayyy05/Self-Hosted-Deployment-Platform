@@ -69,7 +69,7 @@ describe('public hosting configuration', () => {
     const { origin, hostnameSuffix, adminSocketPath, publicOperatorId } = config;
     const hosting = parseHostingConfig({ origin, hostnameSuffix, adminSocketPath, publicOperatorId,
       publicHostingEnabled: true }, 'linux');
-    expect(hosting.publicHosting).toEqual({ operatorId: publicOperatorId });
+    expect(hosting.publicHosting).toEqual({ operatorId: publicOperatorId, dnsTarget: 'apps.example.net' });
     expect(hosting.publicApp).toBeUndefined();
   });
 });

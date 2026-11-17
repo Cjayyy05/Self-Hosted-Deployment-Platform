@@ -34,7 +34,7 @@ type ApplicationHealthCheckDependencies = {
   retryDelayMs?: number;
 };
 
-const requestLocalHealth: LocalHealthRequest = ({
+export const requestLocalHealth: LocalHealthRequest = ({
   hostPort,
   hostAddress,
   path,

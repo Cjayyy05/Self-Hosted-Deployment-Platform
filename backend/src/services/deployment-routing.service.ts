@@ -3,12 +3,13 @@ import { env, type HostingConfig } from '../config/env.js';
 import type { Deployment, Prisma } from '../generated/prisma/client.js';
 import { AppError } from '../utils/app-error.js';
 import { workloadAddress } from '../utils/workload-address.js';
-import { localProjectUrl, projectHostnameLabel, projectRouteProbe, publicProbePath } from '../utils/project-hostname.js';
+import { localProjectUrl, projectHostnameLabel, projectIdFromHostname, projectRouteProbe, publicProbePath } from '../utils/project-hostname.js';
 import { ApplicationHealthCheckService } from './application-health-check.service.js';
 import { ApplicationRoutingError, createApplicationRoutingService, type ApplicationRoutingService } from './application-routing.service.js';
 import { containerService, type RoutingContainer } from './container.service.js';
 import { PublicApplicationPolicy } from './public-application-policy.js';
-import { assertPublicWorkloadReady } from './public-hosting-safety.service.js';
+import { assertPublicWorkloadReady, hasRecordedPublicTarget } from './public-hosting-safety.service.js';
+import { PublicHostingReadinessError, publicHostingReadinessService } from './public-hosting-readiness.service.js';
 import {
   projectOperationLockService,
   type ProjectOperationLease,
@@ -53,7 +54,7 @@ export class DeploymentRoutingService {
   #reconciling = false;
 
   constructor(
-    private readonly routes: Pick<ApplicationRoutingService, 'upsert' | 'remove' | 'repair' | 'readPort' | 'readTarget'>,
+    private readonly routes: Pick<ApplicationRoutingService, 'upsert' | 'remove' | 'repair' | 'readPort' | 'readTarget' | 'readDashboardTargets'>,
     private readonly db: RoutingDatabase = database,
     private readonly containers: Pick<typeof containerService,
       'inspectStatus' | 'inspectOwnedDeploymentContainer' | 'inspectLoopbackRoutingPort' | 'stopContainer' |
@@ -63,19 +64,23 @@ export class DeploymentRoutingService {
     private readonly lock: ProjectOperationLock = projectOperationLockService,
     private readonly hosting: HostingConfig = env.hosting,
     private readonly policy = new PublicApplicationPolicy(hosting),
+    private readonly readiness = publicHostingReadinessService,
   ) {}
 
   public async assertIdle(projectId: string, lease: ProjectOperationLease): Promise<void> {
     await lease.assertValid();
     await this.#idle(projectId);
-    if (this.hosting.publicHosting !== undefined && (await this.db.publicRoutingBinding.findUnique({
+    const operatorId = this.hosting.publicHosting?.operatorId;
+    if (operatorId !== undefined && (await this.db.publicRoutingBinding.findUnique({
       where: { id: 1 }, select: { routeRecoveryRequired: true },
-    }))?.routeRecoveryRequired === true) throw new RoutingPendingError();
+    }))?.routeRecoveryRequired === true) {
+      const target = await this.routes.readTarget(projectId);
+      if (target !== null && !await hasRecordedPublicTarget(this.db, projectId, operatorId, target)) throw new RoutingPendingError();
+    }
   }
 
-  public async assertPublicPortOwned(): Promise<void> {
-    const projectId = this.hosting.publicHosting?.routeProjectId;
-    if (projectId === undefined) return;
+  public async assertPublicPortOwned(projectId: string): Promise<void> {
+    if (this.hosting.publicHosting === undefined) return;
     try {
       const port = await this.routes.readPort(projectId);
       if (port === null) return;
@@ -94,6 +99,7 @@ export class DeploymentRoutingService {
 
   public async promote(candidate: Candidate, startedAt: Date, lease: ProjectOperationLease): Promise<Deployment> {
     let committed: Deployment | undefined;
+    let activationError: unknown;
     try {
       const project = await this.#project(candidate.projectId);
       const restarting = project.routingOperation === 'RESTART' && project.routingDeploymentId === candidate.id;
@@ -107,7 +113,7 @@ export class DeploymentRoutingService {
         await this.health.waitUntilHealthy({ hostPort: target.port, path: pending.healthCheckPath,
           ...this.#healthAddress(target) });
       }
-      await this.#publish(pending, target, lease, false);
+      await this.#publish(pending, target, lease, false, true);
       const previous = pending.activeDeploymentId;
       const retirement = previous === null || previous === candidate.id
         ? clearOperation
@@ -120,7 +126,8 @@ export class DeploymentRoutingService {
           data: { status: 'RUNNING', hostPort: target.port, startedAt, finishedAt: null, errorMessage: null },
         });
       });
-    } catch {
+    } catch (error) {
+      activationError = error;
       // A failed transaction response does not say whether PostgreSQL committed it.
       try {
         await lease.assertValid();
@@ -145,7 +152,11 @@ export class DeploymentRoutingService {
       }
     }
 
-    if (committed === undefined) throw new AppError(502, 'Application route activation failed');
+    if (committed === undefined) {
+      if (activationError instanceof PublicHostingReadinessError) throw activationError;
+      if (this.hosting.publicHosting !== undefined) throw new PublicHostingReadinessError('ROUTING');
+      throw new AppError(502, 'Application route activation failed');
+    }
     try {
       const project = await this.#project(candidate.projectId);
       if (project.routingOperation === 'RETIRE') await this.#retire(project, lease);
@@ -258,11 +269,13 @@ export class DeploymentRoutingService {
     if (this.#reconciling) return;
     this.#reconciling = true;
     try {
+      const operatorId = this.hosting.publicHosting?.operatorId;
+      if (operatorId !== undefined) await this.#recoverPublicRoutes(operatorId);
       const projects = await this.db.project.findMany({
         where: {
-          ...(this.hosting.publicHosting === undefined
-            ? { OR: [{ routingOperation: { not: null } }, { activeDeploymentId: { not: null } }] }
-            : { id: this.hosting.publicHosting.routeProjectId ?? { in: [] } }),
+          ...(operatorId === undefined ? {} : { userId: operatorId }),
+          OR: [{ routingOperation: { not: null } }, { activeDeploymentId: { not: null } },
+            ...(operatorId === undefined ? [] : [{ publicApproval: { revokedAt: { not: null } } }])],
         },
         select: { id: true },
       });
@@ -272,7 +285,6 @@ export class DeploymentRoutingService {
             const lease = requireRoutingLease(held);
             const project = await this.#project(id);
             if (this.hosting.publicHosting !== undefined) {
-              await this.#recoverPublicRoute(project, lease);
               if (project.publicApproval?.revokedAt != null) {
                 if (project.publicApproval.withdrawnAt !== null) await this.#withdrawRevokedDrift(project, lease);
                 return;
@@ -300,17 +312,27 @@ export class DeploymentRoutingService {
     }
   }
 
-  async #recoverPublicRoute(project: RoutingProject, lease: ProjectOperationLease): Promise<void> {
-    const where = { id: 1, projectId: project.id };
+  async #recoverPublicRoutes(operatorId: string): Promise<void> {
+    const where = { id: 1 };
     const binding = await this.db.publicRoutingBinding.findUnique({
       where, select: { routeRecoveryRequired: true },
     });
     if (binding?.routeRecoveryRequired !== true) return;
-    await this.#withdraw(project, lease, true);
-    await this.db.$transaction(async (tx) => {
-      await lease.assertValid(tx);
-      await tx.publicRoutingBinding.update({ where, data: { routeRecoveryRequired: false } });
-    });
+    for (const [host, target] of await this.routes.readDashboardTargets()) {
+      const id = projectIdFromHostname(host, this.hosting.hostnameSuffix);
+      if (id === undefined) throw new RoutingPendingError();
+      if (await hasRecordedPublicTarget(this.db, id, operatorId, target)) continue;
+      if (await this.db.project.findUnique({ where: { id }, select: { id: true } }) === null) {
+        await this.routes.repair(id, undefined, { beforeWrite: async () => {
+          if (await this.db.project.findUnique({ where: { id }, select: { id: true } }) !== null) throw new RoutingPendingError();
+        } });
+      } else {
+        await this.lock.runExclusive(id, async (held) => {
+          await this.#withdraw(await this.#project(id), requireRoutingLease(held), true);
+        });
+      }
+    }
+    await this.db.publicRoutingBinding.update({ where, data: { routeRecoveryRequired: false } });
   }
 
   async #withdrawRevokedDrift(project: RoutingProject, lease: ProjectOperationLease): Promise<void> {
@@ -435,12 +457,15 @@ export class DeploymentRoutingService {
     }
   }
 
-  async #publish(project: RoutingProject, target: VerifiedTarget, lease: ProjectOperationLease, fence: boolean) {
+  async #publish(project: RoutingProject, target: VerifiedTarget, lease: ProjectOperationLease, fence: boolean, verifyPublic = false) {
+    const publicMode = this.hosting.publicHosting !== undefined;
+    const url = new URL(localProjectUrl(projectHostnameLabel(project.id), this.hosting));
     const authorizeWrite = async () => {
       await this.policy.assertApproved(project, target.deployment.commitHash ?? null);
       await lease.assertValid();
     };
     await authorizeWrite();
+    if (publicMode && verifyPublic) await this.readiness.verifyDns(url.hostname);
     if (this.hosting.publicHosting !== undefined && target.deployment.hostPort !== target.port) {
       await this.db.$transaction(async (tx) => {
         await lease.assertValid(tx);
@@ -453,11 +478,10 @@ export class DeploymentRoutingService {
       ...(this.hosting.publicHosting === undefined ? {} : { healthPath: project.healthCheckPath }) };
     if (fence) await this.routes.repair(project.id, target.binding, options);
     else await this.routes.upsert(project.id, target.binding, options);
-    const url = new URL(localProjectUrl(projectHostnameLabel(project.id), this.hosting));
-    const path = this.hosting.publicHosting === undefined ? project.healthCheckPath : publicProbePath(url.hostname, {
+    if (!publicMode) await this.health.waitUntilHealthy(projectRouteProbe(url, project.healthCheckPath));
+    else if (verifyPublic) await this.readiness.verifyHttps(url, publicProbePath(url.hostname, {
       address: target.binding.hostAddress ?? '127.0.0.1', port: target.port,
-    }, project.healthCheckPath);
-    await this.health.waitUntilHealthy(projectRouteProbe(url, path));
+    }, project.healthCheckPath), true);
     if (!await this.#matchesRoute(project.id, target)) throw new RoutingPendingError();
   }
 
@@ -612,7 +636,16 @@ export class DeploymentRoutingService {
       await this.#abortRestart(project, lease);
       return;
     }
-    await this.#publish(project, target, lease, true);
+    if (this.hosting.publicHosting !== undefined && deployment.status !== 'HEALTHCHECKING') {
+      await this.#finish(project, lease, deployment, {}, { status: 'HEALTHCHECKING' });
+    }
+    try {
+      await this.#publish(project, target, lease, true, true);
+    } catch (error) {
+      if (!(error instanceof PublicHostingReadinessError)) throw error;
+      await this.#abortRestart(project, lease);
+      return;
+    }
     await this.#finish(project, lease, deployment, { ...clearOperation, activeDeploymentId: deployment.id }, {
       status: 'RUNNING', hostPort: target.port, finishedAt: null, errorMessage: null,
     });
@@ -639,7 +672,7 @@ export class DeploymentRoutingService {
       await this.#withdraw(project, lease, true);
       await this.policy.assertApproved(project, deployment.commitHash);
       if (this.hosting.publicHosting !== undefined) await assertPublicWorkloadReady(project.id);
-      await this.assertPublicPortOwned();
+      await this.assertPublicPortOwned(project.id);
       await lease.assertValid();
       await this.containers.restartContainer(deployment.containerId, project.containerPort,
         deployment.publicAddressIndex === null ? undefined : workloadAddress(deployment.publicAddressIndex));

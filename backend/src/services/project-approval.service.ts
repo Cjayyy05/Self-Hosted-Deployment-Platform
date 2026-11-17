@@ -1,5 +1,5 @@
 import { database } from '../config/database.js';
-import { env, managesProjectRoute } from '../config/env.js';
+import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
 import { containerService } from './container.service.js';
 import { buildNetworkService } from './build-network.service.js';
@@ -98,10 +98,10 @@ const retryWithdrawal = async (projectId: string, lease: ProjectOperationLease):
       where: { projectId, revokedAt: { not: null }, withdrawnAt: null }, select: { revokedAt: true },
     });
     if (pending?.revokedAt == null) return;
-    const routing = managesProjectRoute(env.hosting, projectId) ? deploymentRoutingService : undefined;
-    if (managesProjectRoute(env.hosting, projectId) && routing === undefined) throw new RoutingPendingError();
+    const routing = deploymentRoutingService;
+    if (routing === undefined) throw new RoutingPendingError();
     const [route, build] = await Promise.allSettled([
-      routing?.withdrawApproval(projectId, lease),
+      routing.withdrawApproval(projectId, lease),
       buildNetworkService.closeProject(projectId),
     ]);
     if (route.status === 'rejected') throw new RoutingPendingError();
@@ -113,7 +113,7 @@ const retryWithdrawal = async (projectId: string, lease: ProjectOperationLease):
     });
     for (const deployment of deployments) {
       await containerService.removeDeploymentContainers(deployment.id, deployment.containerId, async () => {
-        await routing?.assertWithdrawn(projectId, lease);
+        await routing.assertWithdrawn(projectId, lease);
         await lease.assertValid();
       });
     }

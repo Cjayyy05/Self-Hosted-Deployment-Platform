@@ -67,7 +67,8 @@ vi.mock('../src/services/application-detector.service.js', () => ({
   },
 }));
 
-vi.mock('../src/services/application-health-check.service.js', () => ({
+vi.mock('../src/services/application-health-check.service.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/services/application-health-check.service.js')>(),
   applicationHealthCheckService: {
     waitUntilHealthy: infrastructureMocks.waitUntilHealthy,
   },

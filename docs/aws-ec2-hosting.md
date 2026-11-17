@@ -163,27 +163,22 @@ aws ssm start-session --target "<instance-id>" --region ap-southeast-2 --profile
 
 ## Public cutover after separate approvals
 
-1. After public exposure and DNS are authorized, confirm the instance's public IPv4 and publish an exact A record for the approved project hostname in a zone you control. Verify its public answers and check CAA, if present. After separate ingress approval, open inbound TCP 80 and 443 and preserve the existing SSH `/32` rule. For the Hello World deployment with an auto-assigned IPv4, use the [EC2 stop/start recovery checklist](#ec2-stopstart-recovery-checklist).
-2. Set `APP_HOSTNAME_SUFFIX=apps.<your-domain>`, `APP_HOSTING_ORIGIN=https://apps.<your-domain>`, `APP_PUBLIC_HOSTING_ENABLED=true`, `APP_PUBLIC_OPERATOR_ID` to the operator's existing user UUID, and `APP_PUBLIC_PROJECT_ID` to the existing project UUID for the Caddy route. Apply the approval migration before starting the Phase 1 backend. Approve each source revision before deploying and retain the prior approved revision during rollback testing. Repositories, image base tags and network dependencies remain trusted inputs, so pin dependencies for the fixture.
-3. Render the Caddy template with the exact approved hostname. For the certificate rehearsal, add a staging ACME policy, then restore the rendered production config. The backend and browser require trusted certificates for availability. Stop the backend during cutover, start Caddy with the rendered config, and start the backend after Caddy comes up.
+1. Set up and verify [wildcard DNS](#one-time-dynv6-setup). After ingress is authorized, allow public TCP 80 and 443 and preserve the SSH `/32` rule.
+2. Set `APP_HOSTNAME_SUFFIX=apps.dpflw-demo.dynv6.net`, `APP_HOSTING_ORIGIN=https://apps.dpflw-demo.dynv6.net`, `APP_PUBLIC_DNS_TARGET=dpflw-demo.dynv6.net`, `APP_PUBLIC_HOSTING_ENABLED=true`, and `APP_PUBLIC_OPERATOR_ID` to the existing operator's UUID. Keep the original sockets, private binds, firewall, database and certificate storage. Approve each source revision before deploying and retain the prior approved revision during rollback testing.
+3. Stop the backend during the release switch. Validate `infra/caddy/public.json` with the installed Caddy version, install it as `/etc/deployflow/caddy.json`, restart `deployflow-caddy`, and start the verified backend. The bootstrap denies unknown hosts on both ports. Exact HTTPS routes supplied by the backend activate individual certificate management and HTTP redirects. Keep the bootstrap hostname-free, Caddy's default ACME challenge ports reachable, and certificate storage persistent. [Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)
+4. Confirm reconciliation restores the existing Hello World URL and active approved SHA. Deploy a second reviewed app through the private API below. From a separate network, confirm each hostname resolves to the current instance IPv4, redirects over HTTP, validates a trusted certificate with the exact SAN, and serves the expected response. Repeat while redeploying, stopping, restarting and revoking one app. Confirm that an unapproved wildcard name has no certificate or application route. From outside the SSH allowlist, connections to 22, 2019, 2375, 2376, 3000, 4000, 5432, 787 and 8080 should fail. Repeat the listener and route checks after a restart.
 
-   ```sh
-   hostname='<recorded-hostname-label>.apps.<your-domain>'
-   sed "s/APPROVED_HOSTNAME/$hostname/g" infra/caddy/public.json > /tmp/deployflow-public.json
-   jq --arg hostname "$hostname" '.apps.tls.automation.policies = [
-     {subjects: [$hostname], issuers: [{module: "acme", ca: "https://acme-staging-v02.api.letsencrypt.org/directory"}]}
-   ]' /tmp/deployflow-public.json > /tmp/deployflow-staging.json
-   sudo caddy validate --config /tmp/deployflow-public.json
-   ```
+### One-time dynv6 setup
 
-   Install the selected file as `/etc/deployflow/caddy.json` and restart `deployflow-caddy`. Review the Caddy journal for issuance. Repeat with the production config before testing the app.
-4. Use the Phase 1 API below through the private SSH tunnel to approve and deploy an explicit SHA. Confirm the browser reports **Available** and an external network resolves the hostname, receives the HTTP redirect and validates the TLS chain. Fetch the application and its expected version, then check the same URL across successful redeploy, failed redeploy, rollback, restart, and EC2 stop/start. From outside the SSH allowlist, connections to 22, 2019, 2375, 2376, 3000, 4000, 5432, 8080, and the inspected application host port should fail. Confirm that public requests do not reach the management API or webhook handlers. Repeat the socket checks after Caddy reload or restart.
+The proposed record layout uses one IPv4 update target for all applications. Confirm in the authorized rollout that the zone apex can be used for this purpose and has no IPv6 address. In the `dpflw-demo.dynv6.net` zone, set the apex A record to the current EC2 public IPv4 and add `*.apps` as a CNAME to `dpflw-demo.dynv6.net.` Confirm that dynv6 accepts and serves this **nested** wildcard. The provider documents wildcard records generally. During Phase 2, the existing exact hostname and zone apex resolved over IPv4, and an unused app hostname returned NXDOMAIN. Support for the nested record remains a rollout check. If the UI rejects it, check whether the provider supports the nested owner via an authorized record API or an `apps` child zone. Pause the cutover if no wildcard solution works with the existing suffix. [dynv6 changelog](https://dynv6.com/docs/changelog), [dynv6 record API](https://dynv6.github.io/api-spec/)
 
-### Phase 1 compatibility and API
+Keep the existing exact Hello World record during the first comparison. An exact record can override the wildcard, so test the Hello World name alongside two unused `app-<uuid-without-hyphens>.apps.dpflw-demo.dynv6.net` names. After external verification, switch the exact record to the same IPv4-only CNAME target, or retire that exact record once the wildcard is confirmed to serve the same hostname. Check authoritative answers and two public recursive resolvers for the CNAME chain, a single current A address, no AAAA answers, and any applicable CAA constraints. If changing the apex would affect another service, use an IPv4-only reference hostname in the same zone and update that record through an authorized host-side record updater. Set `APP_PUBLIC_DNS_TARGET` to the chosen reference.
+
+### Existing approvals and the private API
 
 For an upgrade of an existing single-project installation, retain the existing `APP_PUBLIC_PROJECT_ID`, `APP_PUBLIC_REPOSITORY_URL`, `APP_PUBLIC_BRANCH`, and `APP_PUBLIC_COMMITS` together. Add the owning user's UUID as `APP_PUBLIC_OPERATOR_ID` and explicitly set `APP_PUBLIC_HOSTING_ENABLED=true`. Stop all older backend writers before the first guarded start. Confirm no old API or manually launched backend is still listening or using Caddy administration. The new backend holds a PostgreSQL session lock for its mode until exit. An incompatible mode cannot start while that lock is held.
 
-Apply all Phase 1 migrations and build with `npm run build` in a fresh release directory. Keep the finished release root-owned and immutable. The build seals the compiled tree, entrypoint, and package metadata. Install the launcher outside the release directory and install the systemd unit as root.
+Apply pending migrations and build with `npm run build` in a fresh release directory. Phase 2 reuses the existing approval, deployment and routing tables. Keep the finished release root-owned and immutable. The build seals the compiled tree, entrypoint, and package metadata. Install the launcher outside the release directory and install the systemd unit as root.
 
 ```sh
 sudo install -m 0644 -o root -g root backend/scripts/release.mjs /usr/local/libexec/deployflow-backend-release.mjs
@@ -204,15 +199,15 @@ Plan a maintenance outage for the first public admission, including an upgrade f
 2. While those writers are offline, read `cat /proc/sys/kernel/random/boot_id` and record that exact value as `APP_PUBLIC_PRE_CUTOVER_BOOT_ID` in the protected backend environment file. Keep writers offline and perform a clean Linux host reboot. A process, Caddy, or Docker daemon restart is insufficient. Use only the boot ID captured during this maintenance window.
 3. After reboot, verify Docker is local to the same booted host and inventory all running, paused, restarting and restart-capable Docker containers. Disable automatic restart and stop, or remove, every object that fails the approval, owner, binding, and resource-limit checks. An approved, restricted active Hello World container can remain privately available.
 4. Start Caddy with the deny-only configuration and start the verified backend. It refuses first admission when the previous boot ID is missing or unchanged, Caddy has an upstream, or the workload inventory fails. On success it records `cutoverBootId` with the binding and marks pre-journal `BUILDING` rows failed while preserving their history. Remove `APP_PUBLIC_PRE_CUTOVER_BOOT_ID` after verifying the recorded admission. The normal restart path uses the stored admission.
-5. Deploy the same approved SHA through the private API. DeployFlow publishes the reserved-address replacement, then verifies ownership and removes the legacy container. Verify `routingOperation` is clear, the legacy row remains in history, and HTTPS serves the replacement before reopening ingress. For an upgrade between Phase 1 builds with changed Caddy route formats, load the deny-only bootstrap during the outage and let reconciliation recreate the route.
+5. Deploy the same approved SHA through the private API if the active container still uses a legacy address. DeployFlow publishes the reserved-address replacement, then verifies ownership and removes the legacy container. Verify `routingOperation` is clear, the legacy row remains in history, and HTTPS serves the replacement before reopening ingress. A Phase 1 installation with a recorded cutover boot ID and an approved reserved-address deployment can use a normal managed restart with the new bootstrap and existing certificate storage.
 
-Use a Bearer token through the SSH tunnel. `GET /api/projects/:id/public-approval` reads status. `PUT /api/projects/:id/public-approval` accepts `{ "repositoryUrl": "https://github.com/owner/repo", "branch": "main", "commitHash": "<full-sha>" }`. Repeat it with each independently reviewed revision. The first write for a legacy project copies its existing allowlist into PostgreSQL. Once the response shows `source: "DATABASE"` and confirms the expected allowlist, the three legacy source variables can be removed at a planned release while keeping the configured Caddy project UUID.
+Use a Bearer token through the SSH tunnel. `GET /api/projects/:id/public-approval` reads status. `PUT /api/projects/:id/public-approval` accepts `{ "repositoryUrl": "https://github.com/owner/repo", "branch": "main", "commitHash": "<full-sha>" }`. Repeat it with each independently reviewed revision. The first write for a legacy project copies its existing allowlist into PostgreSQL. Once the response shows `source: "DATABASE"` and confirms the expected allowlist and active SHA, all four legacy project and source variables can be removed at a planned restart.
 
-Use `{ "commitHash": "<full-sha>" }` with the existing deploy and redeploy endpoints. The dashboard disables those actions in public mode and points to the private API. Restart and rollback use the selected deployment's saved commit and need no new SHA. Replace legacy containers through an approved deploy or rollback. Projects other than the configured Caddy project run with loopback bindings.
+Use `{ "commitHash": "<full-sha>" }` with the existing deploy and redeploy endpoints. The dashboard points to the private API for these public-mode actions. Restart and rollback use the selected deployment's saved commit. Replacement of an old loopback-only deployment requires an approved deployment or rollback. Project reads and public lifecycle responses report the hostname, approval, URL when approved, certificate state, and hosting status. The backend reports specific DNS, certificate, routing or application errors. `AVAILABLE` requires a matching route, public DNS answers consistent with the shared reference, and a trusted HTTPS probe through local Caddy. The dashboard additionally checks the route from the browser. A first certificate has a bounded 60-second wait. If the deployment fails, inspect DNS and the Caddy journal, resolve the issue, and retry the approved SHA.
 
 The independently reviewed full SHA authorizes the exact content. The repository and branch must match the project source. The branch records the operator's review context. DeployFlow fetches the SHA from the configured repository and verifies detached `HEAD`. It does not infer approval from branch membership or require a reviewed historical SHA to remain at the branch tip.
 
-Before removing the legacy source variables, verify `GET /api/projects/:id/public-approval` reports `source: "DATABASE"` and contains the current active deployment's SHA. Check the same HTTPS URL before the first `PUT`, after it, and after a durable-only backend restart. Keep the original project ID, suffix, and socket. The first public startup records this binding durably. Later Phase 1 starts reject removing or changing the binding, including after Caddy restarts with an empty route list. Keep the binding after revocation as well. Retiring or moving a binding requires a separately reviewed offline transition after confirmed withdrawal and shutdown of all writers.
+Check the same Hello World HTTPS URL before the approval import, after it, and after a durable-only restart. Retain the original project row, hostname suffix, sockets and durable binding. The legacy project identifier in that binding is retained for legacy-container verification. Retiring or moving a binding requires a separately reviewed offline transition after confirmed withdrawal and shutdown of all writers.
 
 ### Revocation and emergency containment
 
@@ -224,7 +219,7 @@ For an ambiguous build, check the affected deployment's `buildNetworkId`, `build
 
 Docker stop and restart use a 30-second daemon grace period and a 45-second client deadline. A `503` with an unconfirmed result warrants an inspection of that deployment's container and routing operation. For routed deployments, allow reconciliation to finish the recorded operation. For an unrouted deployment, confirm the container state and retry the appropriate action through the private API. The Caddy authorization proxy allows 250 ms to connect and 1.5 seconds for response headers. A missing or hung authorizer denies forwarding.
 
-If HTTPS still serves the revoked application during an admin-socket failure, the operator should block public TCP 80 and 443 at the existing ingress boundary and verify the block from outside the host. If that control is unavailable, stop the dedicated Caddy service to cut off public traffic. Keep the management tunnel private and leave Docker containers and ports in place during containment. Restore the admin socket or restart Caddy with the approved deny-by-default bootstrap and existing certificate storage. Retry withdrawal and confirm `REVOKED`, an absent proxy in Caddy, and no application response via the local HTTPS listener. Restore ingress only after verifying the expected routes. The preconfigured certificate and redirect may remain because they do not serve the application.
+If HTTPS still serves the revoked application during an admin-socket failure, the operator should block public TCP 80 and 443 at the existing ingress boundary and verify the block from outside the host. If that control is unavailable, stop the dedicated Caddy service to cut off public traffic. Keep the management tunnel private and leave Docker containers and ports in place during containment. Restore the admin socket or restart Caddy with the approved deny-by-default bootstrap and existing certificate storage. Retry withdrawal and confirm `REVOKED`, an absent proxy in Caddy, and no application response via the local HTTPS listener. Restore ingress only after verifying the expected routes. Previously issued certificates can remain in Caddy storage until expiration.
 
 Each public Caddy write consumes a generation from PostgreSQL and installs it with a fresh nonce inside the managed route list. Keep the on-disk bootstrap deny-by-default with no application proxy routes and no generation marker. A reset to that bootstrap cannot satisfy the ETag of a delayed publication because publication requires a previously stamped route list. Recover from the bootstrap and avoid loading previously live configuration snapshots. Reconciliation removes drift even after completed revocations.
 
@@ -269,14 +264,28 @@ If an interrupted port change leaves a live route that disagrees with both datab
 
 ### Update dynv6 only if the public IPv4 changed
 
-1. Compare the current EC2 public IPv4 against the public A record for `app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net`. If they differ, sign in to dynv6 and edit the existing exact A record for this hostname. Set its target to the new IPv4 from EC2 and save. Leave unrelated records and the zone apex alone. This IPv4-only deployment should have no AAAA record for the hostname. Keep dynv6 credentials and update tokens out of commands, logs, and Git. [dynv6 DNS documentation](https://dynv6.com/docs/apis)
-2. Query two public resolvers. Wait out the old TTL if either still returns the old address. Continue once both A answers contain only the new IPv4 and neither returns an AAAA address for this host.
+1. Compare the instance's current public IPv4 with the shared DNS reference. If they differ after wildcard cutover, update that one A record. If the exact Hello World A record is still in use during the transition, update it as well. Before wildcard cutover follow the legacy exact-record procedure and leave unrelated zone records alone.
+2. For the apex layout, an authorized administrator can update the record from a trusted operator workstation or a dedicated host-side job using dynv6's zone-scoped HTTPS API. Keep the raw token with no trailing newline in a protected file readable only by the account running the updater. Keep the file outside the repository, backend environment and Docker build contexts. Supply the confirmed instance IPv4 explicitly. The same command can run from a host-side service on boot, with an IMDSv2 lookup of `public-ipv4` and a comparison against current DNS before updating. Leave metadata inaccessible from containers. [dynv6 Update API](https://dynv6.com/docs/apis), [AWS IMDSv2](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html)
+
+   ```sh
+   curl -q -fsS --max-time 15 --get https://dynv6.com/api/update \
+     --data-urlencode 'zone=dpflw-demo.dynv6.net' \
+     --data-urlencode "ipv4=$current_ec2_ipv4" \
+     --data-urlencode 'token@/etc/deployflow/dynv6-token'
+   ```
+3. Query two public resolvers for the reference and both published names. Wait out the old TTL if either still returns the old address. Continue once A answers contain only the new IPv4 and there are no AAAA answers.
 
    ```powershell
-   $site = 'app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net'
+   $sites = @(
+     'dpflw-demo.dynv6.net',
+     'app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net',
+     '<second-approved-hostname>'
+   )
    foreach ($resolver in '1.1.1.1', '8.8.8.8') {
-     Resolve-DnsName -Name $site -Type A -Server $resolver -DnsOnly
-     Resolve-DnsName -Name $site -Type AAAA -Server $resolver -DnsOnly
+     foreach ($site in $sites) {
+       Resolve-DnsName -Name $site -Type A -Server $resolver -DnsOnly
+       Resolve-DnsName -Name $site -Type AAAA -Server $resolver -DnsOnly
+     }
    }
    ```
 

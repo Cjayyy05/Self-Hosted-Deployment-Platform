@@ -2,18 +2,20 @@ import type { RequestHandler } from 'express';
 
 import { broadcastDeploymentEvent } from '../realtime/deployment-socket.js';
 import { deploymentService } from '../services/deployment.service.js';
+import { getPublicDeploymentHosting } from '../services/project.service.js';
 import { getAuthenticatedUserId } from '../utils/auth-request.js';
 import { parseDeploymentCommit } from '../utils/project-validation.js';
 
 export const deployProject: RequestHandler = async (request, response) => {
+  const userId = getAuthenticatedUserId(request);
   const deployment = await deploymentService.deployProjectForUser(
-    getAuthenticatedUserId(request),
+    userId,
     request.params.id,
     broadcastDeploymentEvent,
     parseDeploymentCommit(request.body),
   );
 
-  response.status(201).json({ deployment });
+  response.status(201).json({ deployment, ...await getPublicDeploymentHosting(userId, deployment.projectId) });
 };
 
 export const listProjectDeployments: RequestHandler = async (
@@ -38,44 +40,48 @@ export const getDeployment: RequestHandler = async (request, response) => {
 };
 
 export const stopDeployment: RequestHandler = async (request, response) => {
+  const userId = getAuthenticatedUserId(request);
   const deployment = await deploymentService.stopDeployment(
-    getAuthenticatedUserId(request),
+    userId,
     request.params.id,
     broadcastDeploymentEvent,
   );
 
-  response.status(200).json({ deployment });
+  response.status(200).json({ deployment, ...await getPublicDeploymentHosting(userId, deployment.projectId) });
 };
 
 export const restartDeployment: RequestHandler = async (request, response) => {
+  const userId = getAuthenticatedUserId(request);
   const deployment = await deploymentService.restartDeployment(
-    getAuthenticatedUserId(request),
+    userId,
     request.params.id,
     broadcastDeploymentEvent,
   );
 
-  response.status(200).json({ deployment });
+  response.status(200).json({ deployment, ...await getPublicDeploymentHosting(userId, deployment.projectId) });
 };
 
 export const redeployDeployment: RequestHandler = async (request, response) => {
+  const userId = getAuthenticatedUserId(request);
   const deployment = await deploymentService.redeployDeployment(
-    getAuthenticatedUserId(request),
+    userId,
     request.params.id,
     broadcastDeploymentEvent,
     parseDeploymentCommit(request.body),
   );
 
-  response.status(201).json({ deployment });
+  response.status(201).json({ deployment, ...await getPublicDeploymentHosting(userId, deployment.projectId) });
 };
 
 export const rollbackDeployment: RequestHandler = async (request, response) => {
+  const userId = getAuthenticatedUserId(request);
   const deployment = await deploymentService.rollbackDeployment(
-    getAuthenticatedUserId(request),
+    userId,
     request.params.id,
     broadcastDeploymentEvent,
   );
 
-  response.status(201).json({ deployment });
+  response.status(201).json({ deployment, ...await getPublicDeploymentHosting(userId, deployment.projectId) });
 };
 
 export const getDeploymentLogs: RequestHandler = async (request, response) => {

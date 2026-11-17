@@ -6,6 +6,8 @@ import { request as httpRequest } from 'node:http';
 import { request } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { TLSSocket } from 'node:tls';
 import { promisify } from 'node:util';
 
 import { io } from 'socket.io-client';
@@ -19,18 +21,38 @@ const label = 'app-11111111111141118111111111111111';
 const suffix = 'apps.example.net';
 const host = label + '.' + suffix;
 const repositoryUrl = 'https://github.com/example/app';
-const commit1 = '1'.repeat(40);
-const commit2 = '2'.repeat(40);
+const otherRepositoryUrl = 'https://github.com/example/another-app';
+
+async function fixtureRepository(directory: string, revisions: string[]) {
+  await exec('git', ['init', '-b', 'main', directory]);
+  const git = (...args: string[]) => exec('git', ['-C', directory, ...args]);
+  const commits = [];
+  for (const revision of revisions) {
+    await writeFile(join(directory, 'Dockerfile'), [
+      'FROM busybox:1.37.0-glibc',
+      'RUN mkdir /www',
+      ...(revision === 'bad' ? [] : [`RUN printf '${revision}' > /www/index.html`]),
+      'CMD ' + JSON.stringify(['sh', '-c', "trap 'sleep 6; exit 0' TERM; httpd -f -p 8080 -h /www & " +
+        'while [ ! -f /tmp/deployflow-stop-fixture ]; do sleep 1; done; exit 1']),
+      '',
+    ].join('\n'));
+    await git('add', 'Dockerfile');
+    await git('-c', 'user.name=DeployFlow Fixture', '-c', 'user.email=fixture@example.net', 'commit', '-m', revision);
+    commits.push((await git('rev-parse', 'HEAD')).stdout.trim());
+  }
+  return commits;
+}
 
 function https(path: string, servername = host, ca?: string, hostHeader = servername) {
-  return new Promise<{ status: number; body: string; cors: string | undefined }>((resolve, reject) => {
+  return new Promise<{ status: number; body: string; cors: string | undefined; san: string | undefined }>((resolve, reject) => {
     const req = request({
       hostname: '127.0.0.1', port: 443, servername, ca, path, agent: false,
       headers: { Host: hostHeader, Origin: 'http://127.0.0.1:3000' },
     }, (res) => {
       let body = '';
       res.setEncoding('utf8').on('data', (part: string) => { body += part; });
-      res.on('end', () => { resolve({ status: res.statusCode ?? 0, body, cors: res.headers['access-control-allow-origin'] }); });
+      const san = req.socket instanceof TLSSocket ? req.socket.getPeerCertificate().subjectaltname : undefined;
+      res.on('end', () => { resolve({ status: res.statusCode ?? 0, body, cors: res.headers['access-control-allow-origin'], san }); });
       res.on('error', reject);
     });
     req.on('error', reject);
@@ -39,8 +61,28 @@ function https(path: string, servername = host, ca?: string, hostHeader = server
   });
 }
 
+async function expectDenied(hostname: string, ca: string) {
+  const status = await https('/', hostname, ca).then((res) => res.status, (error: unknown) => {
+    expect(error instanceof Error && 'code' in error && String(error.code)).toMatch(/^(?:EPROTO$|ERR_SSL_)/);
+    return 404;
+  });
+  expect(status).toBe(404);
+}
+
+function http(hostname: string) {
+  return new Promise<{ status: number | undefined; location: string | undefined }>((resolve, reject) => {
+    const req = httpRequest({ hostname: '127.0.0.1', port: 18085, headers: { Host: hostname } }, (res) => {
+      res.resume();
+      resolve({ status: res.statusCode, location: res.headers.location });
+    });
+    req.on('error', reject);
+    req.setTimeout(2000, () => req.destroy(new Error('HTTP fixture timeout')));
+    req.end();
+  });
+}
+
 describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_SMOKE !== '1')('Linux HTTPS hosting', () => {
-  it('checks real TLS, Docker limits, lifecycle, route recovery and the private Socket.IO API', async () => {
+  it('serves two exact HTTPS hosts through real Docker, Caddy, PostgreSQL and Git', async () => {
     const databaseUrl = new URL(process.env.DEPLOYFLOW_PHASE5B_DB ?? '');
     expect(databaseUrl.hostname).toBe('127.0.0.1');
     expect(databaseUrl.port).toBe('55437');
@@ -49,15 +91,32 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
     const ca = await readFile(certificate, 'utf8');
     const key = join(certificate, '..', 'server.key');
     const folder = await mkdtemp(join(tmpdir(), 'df5-'));
+    const repo = join(folder, 'app-one');
+    const otherRepo = join(folder, 'app-two');
+    const [commit1, commit2, failingCommit] = await fixtureRepository(repo, ['v1', 'v2', 'bad']);
+    const [otherCommit] = await fixtureRepository(otherRepo, ['application-two']);
+    if (!commit1 || !commit2 || !failingCommit || !otherCommit) throw new Error('Missing fixture Git revision');
+    // Redirect the two HTTPS Git URLs to disposable local repositories. Git still fetches and verifies the exact SHA.
+    vi.stubEnv('GIT_CONFIG_COUNT', '2');
+    vi.stubEnv('GIT_CONFIG_KEY_0', 'url.file://' + repo + '.insteadOf');
+    vi.stubEnv('GIT_CONFIG_VALUE_0', repositoryUrl);
+    vi.stubEnv('GIT_CONFIG_KEY_1', 'url.file://' + otherRepo + '.insteadOf');
+    vi.stubEnv('GIT_CONFIG_VALUE_1', otherRepositoryUrl);
     const adminSocket = join(folder, 'admin.sock');
     const config = join(folder, 'caddy.json');
-    const bootstrap = JSON.parse((await readFile('../infra/caddy/public.json', 'utf8')).replaceAll('APPROVED_HOSTNAME', host)) as {
-      admin: { listen: string }; apps: { tls: { certificates: unknown }; http: { servers: { deployflow: { listen: string[]; automatic_https: unknown }; redirect: { listen: string[] } } } };
+    const bootstrap = JSON.parse(await readFile('../infra/caddy/public.json', 'utf8')) as {
+      admin: { listen: string };
+      apps: { tls: unknown; pki: unknown; http: { http_port?: number; servers: {
+        deployflow: { listen: string[] }; redirect: { listen: string[] };
+      } } };
     };
     bootstrap.admin.listen = 'unix/' + adminSocket + '|0660';
-    bootstrap.apps.tls.certificates = { load_files: [{ certificate, key }] };
+    bootstrap.apps.pki = { certificate_authorities: { local: {
+      install_trust: false, intermediate_lifetime: '24h', root: { certificate, private_key: key, format: 'pem_file' },
+    } } };
+    bootstrap.apps.tls = { automation: { policies: [{ issuers: [{ module: 'internal' }] }] } };
     bootstrap.apps.http.servers.deployflow.listen = ['127.0.0.1:443'];
-    bootstrap.apps.http.servers.deployflow.automatic_https = { disable: true };
+    bootstrap.apps.http.http_port = 18085;
     bootstrap.apps.http.servers.redirect.listen = ['127.0.0.1:18085'];
     await writeFile(config, JSON.stringify(bootstrap));
     process.env.DATABASE_URL = databaseUrl.href;
@@ -69,7 +128,7 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
     process.env.APP_PUBLIC_INGRESS_SOCKET = join(folder, 'ingress.sock');
     process.env.APP_PUBLIC_REPOSITORY_URL = repositoryUrl;
     process.env.APP_PUBLIC_BRANCH = 'main';
-    process.env.APP_PUBLIC_COMMITS = commit1 + ',' + commit2;
+    process.env.APP_PUBLIC_COMMITS = [commit1, commit2, failingCommit].join(',');
     process.env.REGISTRATION_ENABLED = 'false';
     delete process.env.GITHUB_WEBHOOK_SECRET_KEY;
 
@@ -77,7 +136,7 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
     const { database } = await import('../src/config/database.js');
     const { attachDeploymentSocket } = await import('../src/realtime/deployment-socket.js');
     const { createAccessToken } = await import('../src/services/token.service.js');
-    const { gitRepositoryService } = await import('../src/services/git-repository.service.js');
+    const { PublicHostingReadinessError, PublicHostingReadinessService } = await import('../src/services/public-hosting-readiness.service.js');
     const { applicationHealthCheckService, ApplicationHealthCheckService } = await import('../src/services/application-health-check.service.js');
     const { createCaddyAdminTransport } = await import('../src/services/caddy-admin-transport.js');
     const { deploymentRoutingService } = await import('../src/services/deployment-routing.service.js');
@@ -111,25 +170,10 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
         await exited;
       }
     };
-    let revision = 'v1';
     let step = 'initial setup';
     const fastHealth = new ApplicationHealthCheckService({ maxAttempts: 4, retryDelayMs: 200 });
     vi.spyOn(applicationHealthCheckService, 'waitUntilHealthy').mockImplementation((input) => fastHealth.waitUntilHealthy(input));
-    // A fixture supplies reviewed files without contacting or modifying a GitHub repository.
-    vi.spyOn(gitRepositoryService, 'prepareRepositoryAtCommit').mockImplementation(async ({ commitHash, ...input }) => {
-      const source = await mkdtemp(join(folder, 'repository-'));
-      await writeFile(join(source, 'Dockerfile'), [
-        'FROM busybox:1.37.0-glibc',
-        'RUN mkdir /www',
-        ...(revision === 'bad' ? [] : [`RUN printf '${revision}' > /www/index.html`]),
-        'CMD ' + JSON.stringify(['sh', '-c', "trap 'sleep 6; exit 0' TERM; httpd -f -p 8080 -h /www & " +
-          'while [ ! -f /tmp/deployflow-stop-fixture ]; do sleep 1; done; exit 1']),
-        '',
-      ].join('\n'));
-      return { repositoryPath: source, commitHash,
-        metadata: { provider: 'github', owner: 'example', name: 'app', ...input } };
-    });
-    vi.spyOn(gitRepositoryService, 'cleanup').mockResolvedValue();
+    const dns = vi.spyOn(PublicHostingReadinessService.prototype, 'verifyDns').mockResolvedValue();
 
     try {
       await database.project.create({
@@ -176,14 +220,21 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
         if (activeDeploymentId === null) throw new Error('Fixture has no active deployment');
         return activeDeploymentId;
       };
-      expect((await https('/', host, ca)).status).toBe(404);
+      await expectDenied(host, ca);
       const otherProject = await api.post('/api/projects').set('Authorization', auth)
-        .send({ name: 'Other', repositoryUrl, containerPort: 8080 }).expect(201);
-      const { project: { id: otherId } } = otherProject.body as { project: { id: string } };
+        .send({ name: 'Other', repositoryUrl: otherRepositoryUrl, containerPort: 8080 }).expect(201);
+      const { project: { id: otherId, publicHostname: otherHost } } = otherProject.body as {
+        project: { id: string; publicHostname: string };
+      };
+      expect(otherHost).toBe('app-' + otherId.replaceAll('-', '') + '.' + suffix);
+      await api.post('/api/projects/' + otherId + '/deploy').set('Authorization', auth).send({ commitHash: otherCommit }).expect(403);
+      await expectDenied(otherHost, ca);
       const first = await api.post('/api/projects/' + projectId + '/deploy').set('Authorization', auth).send({ commitHash: commit1 });
       expect(first.status, JSON.stringify(first.body)).toBe(201);
       const firstId = await active();
-      expect(await https('/', host, ca)).toMatchObject({ status: 200, body: 'v1' });
+      expect(await https('/', host, ca)).toMatchObject({ status: 200, body: 'v1', san: 'DNS:' + host });
+      expect(first.body).toMatchObject({ deployment: { status: 'RUNNING', commitHash: commit1 },
+        hosting: { publicHostname: host, publicApplicationUrl: 'https://' + host, hostingStatus: 'AVAILABLE', certificateStatus: 'READY' } });
       await expect(exec('docker', ['inspect', legacyContainerId])).rejects.toThrow();
       expect(await database.deployment.findUniqueOrThrow({ where: { id: legacyDeploymentId } }))
         .toMatchObject({ status: 'STOPPED', containerId: null, hostPort: null });
@@ -192,11 +243,38 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       await expect(https('/', 'other.apps.example.net', ca)).rejects.toThrow();
       const summary = (await status()).body as { project: { publicProbePath: string } };
       expect(summary.project).toMatchObject({
-        publicApplicationUrl: 'https://' + host, hostingStatus: 'VERIFYING_HTTPS',
+        publicApplicationUrl: 'https://' + host, hostingStatus: 'AVAILABLE',
       });
       const firstProbe = summary.project.publicProbePath;
-      expect(await https(firstProbe, host, ca)).toEqual({ status: 204, body: '', cors: 'http://127.0.0.1:3000' });
+      expect(await https(firstProbe, host, ca)).toMatchObject({ status: 204, body: '', cors: 'http://127.0.0.1:3000' });
       expect((await https(firstProbe + 'wrong', host, ca)).status).toBe(404);
+      await api.put('/api/projects/' + otherId + '/public-approval').set('Authorization', auth)
+        .send({ repositoryUrl: otherRepositoryUrl, branch: 'main', commitHash: otherCommit }).expect(200);
+      const other = await api.post('/api/projects/' + otherId + '/deploy').set('Authorization', auth)
+        .send({ commitHash: otherCommit });
+      expect(other.status, JSON.stringify(other.body)).toBe(201);
+      const { deployment: unrelated } = other.body as { deployment: { id: string; containerId: string } };
+      const expectOtherServed = async () => {
+        expect(await https('/', otherHost, ca)).toMatchObject({ status: 200, body: 'application-two', san: 'DNS:' + otherHost });
+      };
+      const monitorOther = async <T>(operation: PromiseLike<T>): Promise<T> => {
+        const stop = new AbortController();
+        const monitor = (async () => {
+          while (!stop.signal.aborted) {
+            await expectOtherServed();
+            await sleep(150);
+          }
+        })().then(() => undefined, (error: unknown) => ({ error }));
+        const result = await Promise.resolve(operation).finally(() => { stop.abort(); });
+        const failure = await monitor;
+        if (failure !== undefined) throw failure.error;
+        return result;
+      };
+      await expectOtherServed();
+      expect((await https('/', host, ca)).body).toBe('v1');
+      expect((await https('/api/health', host, ca)).status).toBe(404);
+      expect((await https('/api/projects', otherHost, ca)).status).toBe(404);
+      expect((await https('/config/', otherHost, ca)).status).toBe(404);
 
       step = 'stalled authorization';
       if (ingress === undefined) throw new Error('Missing fixture ingress');
@@ -216,16 +294,9 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
         await closed;
         ingress = await startPublicIngress();
       }
-      const redirect = await new Promise<{ status: number | undefined; location: string | undefined }>((resolve, reject) => {
-        const req = httpRequest({ hostname: '127.0.0.1', port: 18085, headers: { Host: host } }, (res) => {
-          res.resume();
-          resolve({ status: res.statusCode, location: res.headers.location });
-        });
-        req.on('error', reject);
-        req.setTimeout(2000, () => req.destroy(new Error('HTTP redirect fixture timeout')));
-        req.end();
-      });
-      expect(redirect).toEqual({ status: 308, location: 'https://' + host + '/' });
+      expect(await http(host)).toEqual({ status: 308, location: 'https://' + host + '/' });
+      expect(await http(otherHost)).toEqual({ status: 308, location: 'https://' + otherHost + '/' });
+      expect((await http('unknown.' + suffix)).status).toBe(404);
 
       step = 'Socket.IO subscription';
       const socket = io('http://127.0.0.1:' + String(address.port), {
@@ -242,16 +313,22 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       }
 
       step = 'failed candidate';
-      revision = 'bad';
-      expect((await action(firstId, 'redeploy')).status).toBe(422);
+      await api.post('/api/deployments/' + firstId + '/redeploy').set('Authorization', auth)
+        .send({ commitHash: failingCommit }).expect(422);
+      expect(await active()).toBe(firstId);
+      expect((await https('/', host, ca)).body).toBe('v1');
+      await expectOtherServed();
+      dns.mockRejectedValueOnce(new PublicHostingReadinessError('DNS'));
+      const dnsFailure = await action(firstId, 'redeploy').expect(502);
+      expect(dnsFailure.body).toMatchObject({ error: { code: 'DNS' } });
       expect(await active()).toBe(firstId);
       expect((await https('/', host, ca)).body).toBe('v1');
       step = 'redeploy';
-      revision = 'v2';
-      const redeploy = await action(firstId, 'redeploy');
+      const redeploy = await monitorOther(action(firstId, 'redeploy'));
       expect(redeploy.status, JSON.stringify(redeploy.body)).toBe(201);
       const secondId = await active();
       expect((await https('/', host, ca)).body).toBe('v2');
+      await expectOtherServed();
       expect((await https(firstProbe, host, ca)).status).toBe(404);
       const currentProbe = ((await status()).body as { project: { publicProbePath: string } }).project.publicProbePath;
       expect(currentProbe).not.toBe(firstProbe);
@@ -267,10 +344,11 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
         await stop(...args);
         throw new ContainerLifecyclePendingError();
       });
-      expect((await action(rollbackId, 'stop')).status).toBe(503);
+      expect((await monitorOther(action(rollbackId, 'stop'))).status).toBe(503);
       expect(await database.project.findUniqueOrThrow({ where: { id: projectId } })).toMatchObject({ routingOperation: 'STOP' });
       await deploymentRoutingService?.reconcile();
-      expect((await https('/', host, ca)).status).toBe(404);
+      await expectDenied(host, ca);
+      await expectOtherServed();
       const restart = containerService.restartContainer.bind(containerService);
       vi.spyOn(containerService, 'restartContainer').mockImplementationOnce(async (...args) => {
         await restart(...args);
@@ -280,24 +358,21 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       expect(await database.project.findUniqueOrThrow({ where: { id: projectId } })).toMatchObject({ routingOperation: 'RESTART' });
       await deploymentRoutingService?.reconcile();
       expect((await https('/', host, ca)).body).toBe('v1');
+      await expectOtherServed();
       await stopCaddy();
       await startCaddy();
       await deploymentRoutingService?.reconcile();
-      expect((await https('/', host, ca)).body).toBe('v1');
+      await vi.waitFor(async () => { expect((await https('/', host, ca)).body).toBe('v1'); });
+      await expectOtherServed();
       const { containerId } = await database.deployment.findUniqueOrThrow({ where: { id: rollbackId } });
       if (containerId === null) throw new Error('Fixture has no active container');
       const { stdout } = await exec('docker', ['inspect', '--format', '{{json .HostConfig}}', containerId]);
       expect(JSON.parse(stdout)).toMatchObject({
-        Memory: 536870912, MemorySwap: 536870912, NanoCpus: 1000000000, PidsLimit: 128, Privileged: false,
+        Memory: 536870912, MemorySwap: 536870912, NanoCpus: 1000000000, PidsLimit: 128, Privileged: false, Binds: null,
         RestartPolicy: { Name: 'unless-stopped' }, SecurityOpt: ['no-new-privileges:true'],
       });
 
       step = 'stop a real crash-looping deployment';
-      await api.put('/api/projects/' + otherId + '/public-approval').set('Authorization', auth)
-        .send({ repositoryUrl, branch: 'main', commitHash: commit2 }).expect(200);
-      const other = await api.post('/api/projects/' + otherId + '/deploy').set('Authorization', auth)
-        .send({ commitHash: commit2 }).expect(201);
-      const { deployment: unrelated } = other.body as { deployment: { id: string; containerId: string } };
       await exec('docker', ['exec', containerId, 'touch', '/tmp/deployflow-stop-fixture']);
       await vi.waitFor(async () => {
         expect(await containerService.inspectStatus(containerId)).toMatchObject({ status: 'restarting' });
@@ -307,14 +382,15 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
         .mockRejectedValueOnce(new ContainerLifecyclePendingError());
       await action(rollbackId, 'stop').expect(503);
       expect(interruptedStop).toHaveBeenCalledExactlyOnceWith(containerId);
-      expect((await https('/', host, ca)).status).toBe(404);
+      await expectDenied(host, ca);
+      await expectOtherServed();
       expect(await database.project.findUniqueOrThrow({ where: { id: projectId } })).toMatchObject({ routingOperation: 'STOP' });
       await deploymentRoutingService?.reconcile();
       expect(await containerService.inspectStatus(containerId)).toMatchObject({ status: 'exited', running: false });
       expect(await database.project.findUniqueOrThrow({ where: { id: projectId } }))
         .toMatchObject({ activeDeploymentId: null, routingOperation: null, routingDeploymentId: null });
       expect(await database.deployment.findUniqueOrThrow({ where: { id: rollbackId } })).toMatchObject({ status: 'STOPPED' });
-      expect((await https('/', host, ca)).status).toBe(404);
+      await expectDenied(host, ca);
 
       const next = await api.post('/api/projects/' + projectId + '/deploy').set('Authorization', auth)
         .send({ commitHash: commit2 }).expect(201);
@@ -340,10 +416,51 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       const complete = await revoke().expect(200);
       expect(complete.body).toMatchObject({ approval: { status: 'REVOKED' } });
       await expect(exec('docker', ['inspect', replacement.containerId])).rejects.toThrow();
-      expect((await https('/', host, ca)).status).toBe(404);
+      await expectDenied(host, ca);
       await deploymentRoutingService?.reconcile();
-      expect((await https('/', host, ca)).status).toBe(404);
+      await expectDenied(host, ca);
+      await expectOtherServed();
       expect((await action(replacement.id, 'restart')).status).toBe(403);
+
+      step = 'managed backend restart';
+      const closedForRestart = new Promise<void>((resolve) => { ingress?.close(() => { resolve(); }); });
+      ingress?.closeAllConnections();
+      await closedForRestart;
+      ingress = undefined;
+      let backendLogs = '';
+      const backendEnv: NodeJS.ProcessEnv = { ...process.env, PORT: '18087', BIND_HOST: '127.0.0.1', APP_PUBLIC_HOSTING_ENABLED: 'true' };
+      delete backendEnv.APP_PUBLIC_PROJECT_ID;
+      delete backendEnv.APP_PUBLIC_REPOSITORY_URL;
+      delete backendEnv.APP_PUBLIC_BRANCH;
+      delete backendEnv.APP_PUBLIC_COMMITS;
+      for (const attempt of [1, 2]) {
+        step = 'managed backend restart ' + String(attempt);
+        await stopCaddy();
+        await startCaddy();
+        await expectDenied(otherHost, ca);
+        const backend = spawn(process.execPath, ['--import', 'tsx', 'src/server.ts'], {
+          env: backendEnv,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        backend.stdout.resume();
+        backend.stderr.on('data', (data: Buffer) => { backendLogs = (backendLogs + data.toString()).slice(-8000); });
+        try {
+          await vi.waitFor(async () => {
+            expect((await fetch('http://127.0.0.1:18087/api/health', { signal: AbortSignal.timeout(1000) })).status).toBe(200);
+            await expectOtherServed();
+          }, { timeout: 15_000 });
+          await expectDenied(host, ca);
+        } catch (error) {
+          console.error(backendLogs);
+          throw error;
+        } finally {
+          if (backend.exitCode === null && backend.signalCode === null) {
+            const exited = once(backend, 'exit');
+            backend.kill('SIGTERM');
+            await exited;
+          }
+        }
+      }
     } catch (error) {
       console.error('Linux hosting fixture failed during ' + step + '\n' + caddyLogs);
       throw error;

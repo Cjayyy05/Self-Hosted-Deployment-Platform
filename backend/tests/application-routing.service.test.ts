@@ -12,6 +12,8 @@ const container = {
   deploymentId: '22222222-2222-4222-8222-222222222222',
   containerPort: 8080,
 };
+const publicContainer = { ...container, hostAddress: '127.64.0.1' };
+const publicRouting = (allocateGeneration: () => Promise<bigint>) => ({ ingressSocket: '/tmp/auth.sock', allocateGeneration });
 const fallback = {
   handle: [{ handler: 'static_response', status_code: 404, body: 'Unknown host' }],
   terminal: true,
@@ -40,21 +42,26 @@ function fixture(initial: unknown[] = [fallback]) {
 }
 
 describe('ApplicationRoutingService', () => {
-  it('limits public route writes to the configured project and verifies read-back', async () => {
+  it('serializes exact public routes for multiple projects and verifies independent withdrawal', async () => {
     const { transport, docker } = fixture();
+    docker.inspectLoopbackRoutingPort.mockResolvedValue(787);
     let generation = 0n;
-    const service = new ApplicationRoutingService(transport, 'apps.example.net', docker, project, () => Promise.resolve(++generation));
+    const service = new ApplicationRoutingService(transport, 'apps.example.net', docker, publicRouting(() => Promise.resolve(++generation)));
     const beforeWrite = () => Promise.resolve();
-    await expect(service.upsert(second, container)).rejects.toMatchObject({ code: 'rejected' });
-    expect(transport).not.toHaveBeenCalled();
-    await service.upsert(project, container, { healthPath: '/ready', beforeWrite });
-    expect(await service.readPort(project)).toBe(49153);
+    await expect(service.upsert(second, publicContainer)).rejects.toMatchObject({ code: 'rejected' });
+    await Promise.all([
+      service.upsert(project, publicContainer, { healthPath: '/ready', beforeWrite }),
+      service.upsert(second, { ...publicContainer, hostAddress: '127.64.0.2' }, { beforeWrite }),
+    ]);
+    expect(await service.readTarget(project)).toEqual({ address: '127.64.0.1', port: 787 });
     await service.remove(project, { beforeWrite });
     expect(await service.readPort(project)).toBeNull();
+    expect(await service.readTarget(second)).toEqual({ address: '127.64.0.2', port: 787 });
   });
 
   it('rejects a delayed publication when withdrawal and a bootstrap reset reuse the original ETag', async () => {
     const { docker } = fixture();
+    docker.inspectLoopbackRoutingPort.mockResolvedValue(787);
     let current = JSON.stringify([fallback]);
     let revision = 1;
     let generation = 0n;
@@ -77,9 +84,9 @@ describe('ApplicationRoutingService', () => {
         await pause;
       }
       return transport(input);
-    }, 'apps.example.net', docker, project, allocate);
-    const second = new ApplicationRoutingService(transport, 'apps.example.net', docker, project, allocate);
-    const publication = first.upsert(project, container, { beforeWrite }).then(
+    }, 'apps.example.net', docker, publicRouting(allocate));
+    const second = new ApplicationRoutingService(transport, 'apps.example.net', docker, publicRouting(allocate));
+    const publication = first.upsert(project, publicContainer, { beforeWrite }).then(
       () => 'published',
       (error: unknown) => error,
     );

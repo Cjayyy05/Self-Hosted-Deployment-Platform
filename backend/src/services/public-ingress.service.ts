@@ -5,26 +5,31 @@ import { setTimeout } from 'node:timers/promises';
 
 import { database } from '../config/database.js';
 import { env, type HostingConfig } from '../config/env.js';
-import { projectHostnameLabel } from '../utils/project-hostname.js';
-import { workloadAddress } from '../utils/workload-address.js';
+import { projectIdFromHostname, projectHostnameLabel } from '../utils/project-hostname.js';
+import { RESERVED_WORKLOAD_PORT, workloadAddress } from '../utils/workload-address.js';
 import { DEFAULT_INGRESS_SOCKET } from './application-routing.service.js';
 import { PublicApplicationPolicy } from './public-application-policy.js';
 
 export async function authorizePublicIngress(host: unknown, target: unknown, hosting: HostingConfig = env.hosting, db = database) {
-  const projectId = hosting.publicHosting?.routeProjectId;
-  if (projectId === undefined || host !== projectHostnameLabel(projectId) + '.' + hosting.hostnameSuffix ||
-    typeof target !== 'string') return false;
+  if (hosting.publicHosting === undefined || typeof host !== 'string' || typeof target !== 'string') return false;
+  const projectId = projectIdFromHostname(host, hosting.hostnameSuffix);
+  if (projectId === undefined) return false;
   return db.$transaction(async (tx) => {
     const project = await tx.project.findUnique({
       where: { id: projectId }, include: { activeDeployment: true, routingDeployment: true },
     });
-    if (project === null) return false;
+    if (project?.hostnameLabel !== projectHostnameLabel(projectId)) return false;
     const liveLease = project.operationLockToken !== null && project.operationLockExpiresAt !== null &&
       project.operationLockExpiresAt.getTime() > Date.now();
-    const eligible = liveLease && (project.routingOperation === 'PROMOTE' || project.routingOperation === 'RESTART')
-      ? [project.activeDeployment, project.routingDeployment] : [project.activeDeployment];
+    const active = project.activeDeployment;
+    const withdrawing = project.routingOperation === 'STOP' || project.routingOperation === 'DELETE' ||
+      (project.routingOperation === 'ABORT' && project.routingDeploymentId === project.activeDeploymentId);
+    const eligible = [!withdrawing && active?.status === 'RUNNING' ? active : null];
+    if (liveLease && (project.routingOperation === 'PROMOTE' || project.routingOperation === 'RESTART')) {
+      eligible.push(project.routingDeployment?.status === 'HEALTHCHECKING' ? project.routingDeployment : null);
+    }
     const chosen = eligible.find((candidate) => candidate?.containerId != null &&
-      candidate.publicAddressIndex !== null && candidate.hostPort !== null &&
+      candidate.projectId === projectId && candidate.publicAddressIndex !== null && candidate.hostPort === RESERVED_WORKLOAD_PORT &&
       target === workloadAddress(candidate.publicAddressIndex) + ':' + String(candidate.hostPort));
     if (chosen == null) return false;
     await new PublicApplicationPolicy(hosting, db).assertApproved(project, chosen.commitHash, tx);
@@ -33,7 +38,7 @@ export async function authorizePublicIngress(host: unknown, target: unknown, hos
 }
 
 export async function startPublicIngress(hosting: HostingConfig = env.hosting) {
-  if (hosting.publicHosting?.routeProjectId === undefined) return undefined;
+  if (hosting.publicHosting === undefined) return undefined;
   const path = hosting.publicHosting.ingressSocketPath ?? DEFAULT_INGRESS_SOCKET;
   try {
     if (!(await lstat(path)).isSocket()) throw new Error('The public ingress path is not a socket');

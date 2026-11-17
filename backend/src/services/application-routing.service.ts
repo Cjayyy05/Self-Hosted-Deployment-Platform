@@ -5,8 +5,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { env, parseHostingConfig, type HostingConfig } from '../config/env.js';
 import { database } from '../config/database.js';
 import { parseHealthCheckPath } from '../utils/health-check-path.js';
-import { isWorkloadAddress } from '../utils/workload-address.js';
-import { projectHostnameLabel, PUBLIC_PROBE_PREFIX, publicProbePath, type RouteTarget } from '../utils/project-hostname.js';
+import { isWorkloadAddress, RESERVED_WORKLOAD_PORT } from '../utils/workload-address.js';
+import { projectHostnameLabel, projectIdFromHostname, PUBLIC_PROBE_PREFIX, publicProbePath, type RouteTarget } from '../utils/project-hostname.js';
 import {
   CADDY_REQUEST_TIMEOUT_MS,
   createCaddyAdminTransport,
@@ -59,14 +59,14 @@ const authorize = (socket: string, hostname: string, address: string, port: numb
   handle_response: [{ match: { status_code: [2] }, routes: [{ handle: [{ handler: 'vars' }] }] }],
 });
 
-const publicRoute = (hostname: string, port: number, healthPath: string, address = '127.0.0.1', socket?: string) => ({
+const publicRoute = (hostname: string, port: number, healthPath: string, address: string, socket: string) => ({
   match: [{ host: [hostname] }] as const,
   handle: [{
     handler: 'subroute',
     routes: [
       {
         match: [{ path: [publicProbePath(hostname, { address, port }, healthPath)], method: ['GET'] }],
-        handle: [...(socket === undefined ? [] : [authorize(socket, hostname, address, port)]), {
+        handle: [authorize(socket, hostname, address, port), {
           ...proxy(port, address),
           rewrite: { method: 'GET', uri: healthPath + '?' },
           headers: { request: { delete: ['Authorization', 'Cookie'] } },
@@ -78,7 +78,7 @@ const publicRoute = (hostname: string, port: number, healthPath: string, address
         ...unknownHostRoute,
         match: [{ path: [PUBLIC_PROBE_PREFIX + '*'] }],
       },
-      { handle: [...(socket === undefined ? [] : [authorize(socket, hostname, address, port)]), proxy(port, address)], terminal: true },
+      { handle: [authorize(socket, hostname, address, port), proxy(port, address)], terminal: true },
     ],
   }],
   terminal: true,
@@ -89,6 +89,7 @@ type Fallback = typeof unknownHostRoute & { '@id'?: string };
 type Routes = [...ApplicationRoute[], Fallback];
 type RouteState = { routes: Routes; etag: string };
 type RouteWrite = { beforeWrite?: () => Promise<void>; expectedPort?: number; healthPath?: string };
+type PublicRouting = { ingressSocket: string; allocateGeneration?: () => Promise<bigint> };
 type RoutingErrorCode = 'unavailable' | 'invalid-config' | 'conflict' | 'rejected' | 'uncertain';
 
 export class ApplicationRoutingError extends Error {
@@ -114,7 +115,7 @@ const upstreamTarget = (route: ApplicationRoute) => {
   return { address, port: Number(port) };
 };
 
-const parseRoutes = (body: string, suffix: string, publicHostname?: string, ingressSocket?: string): Routes => {
+const parseRoutes = (body: string, suffix: string, publicRouting?: PublicRouting): Routes => {
   const data: unknown = JSON.parse(body);
   const fallback: unknown = Array.isArray(data) ? data.at(-1) : undefined;
   if (!Array.isArray(data) || !isRecord(fallback)) {
@@ -138,27 +139,27 @@ const parseRoutes = (body: string, suffix: string, publicHostname?: string, ingr
     const probeHandlers = firstRecord(handler?.routes)?.handle;
     const lastProbeHandler: unknown = Array.isArray(probeHandlers) ? probeHandlers.at(-1) : undefined;
     const subroute = isRecord(lastProbeHandler) ? lastProbeHandler : undefined;
-    const dial = firstRecord((publicHostname === undefined ? handler : subroute)?.upstreams)?.dial;
+    const dial = firstRecord((publicRouting === undefined ? handler : subroute)?.upstreams)?.dial;
     const match = typeof dial === 'string' && /^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}):([1-9]\d{0,4})$/.exec(dial);
     if (
       typeof host !== 'string' ||
-      (publicHostname !== undefined && host !== publicHostname) ||
-      !host.endsWith('.' + suffix) ||
-      !/^app-[a-f0-9]{32}$/.test(host.slice(0, -(suffix.length + 1))) ||
+      projectIdFromHostname(host, suffix) === undefined ||
       !match ||
-      match[1] === undefined || (match[1] !== '127.0.0.1' && (publicHostname === undefined || !isWorkloadAddress(match[1]))) ||
+      match[1] === undefined ||
+      (publicRouting === undefined ? match[1] !== '127.0.0.1' :
+        (!isWorkloadAddress(match[1]) || Number(match[2]) !== RESERVED_WORKLOAD_PORT)) ||
       Number(match[2]) > 65_535 ||
       seen.has(host)
     ) {
       throw new Error('Caddy returned an invalid or duplicate managed route');
     }
     const rewrite = subroute?.rewrite;
-    const route = publicHostname === undefined
+    const route = publicRouting === undefined
       ? localRoute(host, Number(match[2]))
       : publicRoute(host, Number(match[2]), parseHealthCheckPath(
         isRecord(rewrite) && typeof rewrite.uri === 'string' && rewrite.uri.endsWith('?')
           ? rewrite.uri.slice(0, -1) : null,
-      ), match[1], ingressSocket);
+      ), match[1], publicRouting.ingressSocket);
     if (!isDeepStrictEqual(entry, route)) throw new Error('Caddy route is outside the managed layout');
     seen.add(host);
     routes.push(route);
@@ -171,18 +172,14 @@ export class ApplicationRoutingService {
   #uncertain = false;
   #dashboardRoutes: { expiresAt: number; targets: Promise<ReadonlyMap<string, RouteTarget>> } | undefined;
   readonly #hostnameSuffix: string;
-  readonly #publicHostname: string | undefined;
 
   constructor(
     private readonly transport: CaddyAdminTransport,
     hostnameSuffix: string,
     private readonly docker: Pick<typeof containerService, 'inspectLoopbackRoutingPort'> = containerService,
-    publicProjectId?: string,
-    private readonly allocatePublicGeneration?: () => Promise<bigint>,
-    private readonly ingressSocket?: string,
+    private readonly publicRouting?: PublicRouting,
   ) {
     this.#hostnameSuffix = parseHostingConfig({ hostnameSuffix }).hostnameSuffix;
-    this.#publicHostname = publicProjectId === undefined ? undefined : this.#hostname(publicProjectId);
   }
 
   public upsert(projectId: string, container: RoutingContainer, options?: RouteWrite): Promise<void> {
@@ -236,14 +233,14 @@ export class ApplicationRoutingService {
 
   async #revision(beforeWrite?: () => Promise<void>): Promise<Fallback> {
     const nonce = randomUUID().replaceAll('-', '');
-    if (this.#publicHostname === undefined) {
+    if (this.publicRouting === undefined) {
       await beforeWrite?.();
       return { ...unknownHostRoute, '@id': 'deployflow-revision-' + nonce };
     }
-    if (beforeWrite === undefined || this.allocatePublicGeneration === undefined) {
+    if (beforeWrite === undefined || this.publicRouting.allocateGeneration === undefined) {
       throw new ApplicationRoutingError('rejected', 'Public routing requires a durable generation and a project lease');
     }
-    const generation = await this.allocatePublicGeneration();
+    const generation = await this.publicRouting.allocateGeneration();
     await beforeWrite();
     return { ...unknownHostRoute, '@id': 'deployflow-public-' + String(generation) + '-' + nonce };
   }
@@ -251,7 +248,7 @@ export class ApplicationRoutingService {
   async #publicationBase(current: RouteState, beforeWrite?: () => Promise<void>): Promise<RouteState> {
     const revision = (current.routes.at(-1) as Fallback | undefined)?.['@id'];
     if (revision !== undefined && PUBLIC_REVISION.test(revision)) return current;
-    if (revision === undefined && current.routes.length !== 1) {
+    if (current.routes.length !== 1) {
       throw new ApplicationRoutingError('invalid-config', 'An unversioned public bootstrap must have no upstreams');
     }
     // A write against a resettable bootstrap may only stamp the current
@@ -277,11 +274,8 @@ export class ApplicationRoutingService {
         throw new ApplicationRoutingError('uncertain', 'Caddy routing writes are paused until the last update is reconciled');
       }
       const hostname = this.#hostname(projectId);
-      if (this.#publicHostname !== undefined && hostname !== this.#publicHostname) {
-        throw new ApplicationRoutingError('rejected', 'Only the approved project can change the public route');
-      }
       let current = await this.#readRoutes();
-      if (container !== undefined && this.#publicHostname !== undefined) {
+      if (container !== undefined && this.publicRouting !== undefined) {
         current = await this.#publicationBase(current, options?.beforeWrite);
       }
       const routes = current.routes.slice(0, -1) as ApplicationRoute[];
@@ -294,9 +288,15 @@ export class ApplicationRoutingService {
           (options?.expectedPort !== undefined && port !== options.expectedPort)) {
           throw new ApplicationRoutingError('rejected', 'Docker routing binding changed after verification');
         }
-        const route = this.#publicHostname === undefined
-          ? localRoute(hostname, port)
-          : publicRoute(hostname, port, parseHealthCheckPath(options?.healthPath), container.hostAddress, this.ingressSocket);
+        let route: ApplicationRoute;
+        if (this.publicRouting === undefined) route = localRoute(hostname, port);
+        else {
+          const address = container.hostAddress;
+          if (address === undefined || !isWorkloadAddress(address) || port !== RESERVED_WORKLOAD_PORT) {
+            throw new ApplicationRoutingError('rejected', 'Public routing requires a reserved Docker loopback binding');
+          }
+          route = publicRoute(hostname, port, parseHealthCheckPath(options?.healthPath), address, this.publicRouting.ingressSocket);
+        }
         if (index === -1) routes.push(route);
         else routes[index] = route;
       }
@@ -325,7 +325,7 @@ export class ApplicationRoutingService {
       throw new ApplicationRoutingError('invalid-config', 'Caddy did not return the managed route list and its ETag');
     }
     try {
-      return { routes: parseRoutes(response.body, this.#hostnameSuffix, this.#publicHostname, this.ingressSocket), etag: response.etag };
+      return { routes: parseRoutes(response.body, this.#hostnameSuffix, this.publicRouting), etag: response.etag };
     } catch {
       throw new ApplicationRoutingError('invalid-config', 'Caddy route list does not match the DeployFlow bootstrap layout');
     }
@@ -368,13 +368,12 @@ export const createApplicationRoutingService = (
   hosting: HostingConfig = env.hosting,
 ): ApplicationRoutingService | undefined => {
   const { adminSocketPath, hostnameSuffix } = hosting;
-  const projectId = hosting.publicHosting?.routeProjectId;
-  if (adminSocketPath === undefined || (hosting.publicHosting !== undefined && projectId === undefined)) return undefined;
+  if (adminSocketPath === undefined) return undefined;
   const allocate = async () => (await database.publicRoutingBinding.update({
-    where: { id: 1, projectId: projectId ?? null, adminSocketPath, hostnameSuffix },
+    where: { id: 1, adminSocketPath, hostnameSuffix, ingressSocketPath },
     data: { routeGeneration: { increment: 1 } }, select: { routeGeneration: true },
   })).routeGeneration;
+  const ingressSocketPath = hosting.publicHosting?.ingressSocketPath ?? DEFAULT_INGRESS_SOCKET;
   return new ApplicationRoutingService(createCaddyAdminTransport(adminSocketPath), hostnameSuffix,
-    containerService, projectId, projectId === undefined ? undefined : allocate,
-    projectId === undefined ? undefined : hosting.publicHosting?.ingressSocketPath ?? DEFAULT_INGRESS_SOCKET);
+    containerService, hosting.publicHosting === undefined ? undefined : { ingressSocket: ingressSocketPath, allocateGeneration: allocate });
 };

@@ -11,7 +11,7 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Client } from 'pg';
 import { io } from 'socket.io-client';
 import request from 'supertest';
-import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { PrismaClient } from '../src/generated/prisma/client.js';
 import type { DockerClient, RoutingContainer } from '../src/services/container.service.js';
@@ -30,6 +30,7 @@ const fixture = vi.hoisted(() => ({
   nextPort: 51010,
   route: null as number | null,
   routeAddress: '127.0.0.1',
+  otherRoutes: new Map<string, { address: string; port: number }>(),
   adminUnavailable: false,
 }));
 
@@ -42,7 +43,7 @@ vi.mock('../src/config/env.js', async (importOriginal) => {
       ...module.env, registrationEnabled: false, githubWebhookSecretKey: undefined,
       hosting: {
         origin: 'https://apps.example.net', hostnameSuffix: 'apps.example.net', adminSocketPath: '/tmp/caddy-fixture.sock',
-        publicHosting: { operatorId: fixture.operator, routeProjectId: fixture.project },
+        publicHosting: { operatorId: fixture.operator, legacyProjectId: fixture.project },
         publicApp: {
           projectId: fixture.project, repositoryUrl: fixture.repository, branch: 'main', commits: new Set([fixture.legacyCommit]),
         },
@@ -54,23 +55,32 @@ vi.mock('../src/config/env.js', async (importOriginal) => {
 vi.mock('../src/services/application-routing.service.js', async (importOriginal) => {
   const module = await importOriginal<typeof import('../src/services/application-routing.service.js')>();
   const write = async (id: string, target?: RoutingContainer, options?: { beforeWrite?: () => Promise<void> }) => {
-    expect(id).toBe(fixture.project);
     if (fixture.adminUnavailable) throw new module.ApplicationRoutingError('unavailable', 'Fixture admin unavailable');
     await options?.beforeWrite?.();
-    fixture.route = target === undefined ? null : fixture.running.get(target.containerId) ?? null;
-    fixture.routeAddress = target?.hostAddress ?? '127.0.0.1';
+    const port = target === undefined ? undefined : fixture.running.get(target.containerId);
+    const address = target?.hostAddress ?? '127.0.0.1';
+    if (id === fixture.project) {
+      fixture.route = port ?? null;
+      fixture.routeAddress = address;
+    } else if (port === undefined) fixture.otherRoutes.delete(id);
+    else fixture.otherRoutes.set(id, { address, port });
   };
+  const read = (id: string) => id === fixture.project
+    ? fixture.route === null ? null : { address: fixture.routeAddress, port: fixture.route }
+    : fixture.otherRoutes.get(id) ?? null;
+  const host = (id: string) => 'app-' + id.replaceAll('-', '') + '.apps.example.net';
+  const unavailable = () => new module.ApplicationRoutingError('unavailable', 'Fixture admin unavailable');
   return {
     ...module,
     createApplicationRoutingService: () => ({
       upsert: write, repair: write,
       remove: (id: string, options?: { beforeWrite?: () => Promise<void> }) => write(id, undefined, options),
-      readPort: () => fixture.adminUnavailable
-        ? Promise.reject(new module.ApplicationRoutingError('unavailable', 'Fixture admin unavailable'))
-        : Promise.resolve(fixture.route),
-      readTarget: () => fixture.adminUnavailable
-        ? Promise.reject(new module.ApplicationRoutingError('unavailable', 'Fixture admin unavailable'))
-        : Promise.resolve(fixture.route === null ? null : { address: fixture.routeAddress, port: fixture.route }),
+      readPort: (id: string) => fixture.adminUnavailable ? Promise.reject(unavailable()) : Promise.resolve(read(id)?.port ?? null),
+      readTarget: (id: string) => fixture.adminUnavailable ? Promise.reject(unavailable()) : Promise.resolve(read(id)),
+      readDashboardTargets: () => fixture.adminUnavailable ? Promise.reject(unavailable()) : Promise.resolve(new Map([
+        ...(fixture.route === null ? [] : [[host(fixture.project), { address: fixture.routeAddress, port: fixture.route }] as const]),
+        ...Array.from(fixture.otherRoutes, ([id, target]) => [host(id), target] as const),
+      ])),
     }),
   };
 });
@@ -171,6 +181,12 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
     otherAuth = 'Bearer ' + await createAccessToken(fixture.otherUser);
   }, 20_000);
 
+  beforeEach(async () => {
+    const { PublicHostingReadinessService } = await import('../src/services/public-hosting-readiness.service.js');
+    vi.spyOn(PublicHostingReadinessService.prototype, 'verifyDns').mockResolvedValue();
+    vi.spyOn(PublicHostingReadinessService.prototype, 'verifyHttps').mockResolvedValue();
+  });
+
   afterAll(async () => {
     await closeSocket?.();
     await fixture.db?.$disconnect();
@@ -249,9 +265,9 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
     delete durable.publicApp;
     const route = () => Promise.resolve(new Map());
     const inventory = () => Promise.resolve([]);
-    const correct = { operatorId: fixture.operator, routeProjectId: fixture.project };
+    const correct = { operatorId: fixture.operator, legacyProjectId: fixture.project };
     await expect(assertPublicHostingStartup({ ...env.hosting, publicHosting: { operatorId: fixture.otherUser,
-      routeProjectId: fixture.project } }, db, route)).rejects.toThrow('belong to the configured operator');
+      legacyProjectId: fixture.project } }, db, route)).rejects.toThrow('belong to the configured operator');
     await expect(assertPublicHostingStartup(durable, db, route)).rejects.toThrow('active public SHA');
     await expect(assertPublicHostingStartup(env.hosting, db,
       () => Promise.resolve(new Map([['fixture.apps.example.net', { address: '127.0.0.1', port: 51002 }]]))))
@@ -273,8 +289,8 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
       vi.unstubAllEnvs();
     }
     await expect(assertPublicHostingStartup({ ...durable, publicHosting: { operatorId: fixture.operator } }, db, route))
-      .rejects.toThrow('recorded binding');
-    await expect(assertPublicHostingStartup({ ...durable, publicHosting: { ...correct, routeProjectId: fixture.otherUser } }, db, route))
+      .rejects.toThrow('active public SHA');
+    await expect(assertPublicHostingStartup({ ...durable, publicHosting: { ...correct, legacyProjectId: fixture.otherUser } }, db, route))
       .rejects.toThrow('recorded binding');
     await expect(assertPublicHostingStartup({ origin: 'http://localhost:8080', hostnameSuffix: 'localhost',
       adminSocketPath: undefined }, db, route)).rejects.toThrow('must stay enabled');
@@ -363,7 +379,7 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
     expect((await api.post('/api/webhooks/github/' + fixture.project).send({})).status).toBe(404);
   });
 
-  it('validates approval inputs, deploys a pinned SHA after branch movement, and keeps other projects off Caddy', async () => {
+  it('validates approval inputs and routes a pinned SHA independently of the legacy project', async () => {
     const { checkout, branchTip, start, build } = await mockWorkload();
     const created = await api.post('/api/projects').set('Authorization', auth)
       .send({ name: 'New project', repositoryUrl: fixture.repository, containerPort: 8080 });
@@ -388,7 +404,7 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
     expect(branchTip).not.toHaveBeenCalled();
     expect(build).toHaveBeenCalledOnce();
     expect(fixture.route).toBeNull();
-    expect((await db.project.findUniqueOrThrow({ where: { id } })).activeDeploymentId).toBeNull();
+    expect((await db.project.findUniqueOrThrow({ where: { id } })).activeDeploymentId).not.toBeNull();
   });
 
   it('does not commit a route when authorization fails inside the promotion transaction', async () => {
@@ -420,7 +436,8 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
     fixture.route = 51001;
     fixture.routeAddress = '127.64.0.9';
     await assertPublicHostingStartup(env.hosting, db,
-      () => Promise.resolve(new Map([['fixture.apps.example.net', { address: fixture.routeAddress, port: 51001 }]])),
+      () => Promise.resolve(new Map([['app-' + fixture.project.replaceAll('-', '') + '.apps.example.net',
+        { address: fixture.routeAddress, port: 51001 }]])),
       () => Promise.resolve([]));
     expect(await db.publicRoutingBinding.findUnique({ where: { id: 1 } }))
       .toMatchObject({ routeRecoveryRequired: true });
@@ -584,7 +601,7 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
       await api.put(approvalUrl(fixture.project)).set('Authorization', auth).send(approvalInput(nextCommit)).expect(409);
       await api.post(actionUrl(activeId, 'stop')).set('Authorization', auth).expect(503);
       await api.delete('/api/projects/' + fixture.project).set('Authorization', auth).expect(503);
-      await api.post(deployUrl(other.id)).set('Authorization', auth).send({ commitHash: nextCommit }).expect(201);
+      await api.post(deployUrl(other.id)).set('Authorization', auth).send({ commitHash: nextCommit }).expect(503);
       const { ApplicationRoutingError } = await import('../src/services/application-routing.service.js');
       await assertPublicHostingStartup(durable, db, () =>
         Promise.reject(new ApplicationRoutingError('unavailable', 'Fixture admin unavailable')), () => Promise.resolve([]));
@@ -776,13 +793,14 @@ describe.skipIf(dbUrl === undefined)('Phase 1 public approvals with disposable P
       .send({ name: 'Dedicated address', repositoryUrl: fixture.repository, containerPort: 8080 }).expect(201);
     const { project: { id, hostnameLabel } } = created.body as { project: { id: string; hostnameLabel: string } };
     const host = hostnameLabel + '.' + env.hosting.hostnameSuffix;
-    const hosting = { ...env.hosting, publicHosting: { operatorId: fixture.operator, routeProjectId: id } };
+    const hosting = { ...env.hosting, publicHosting: { operatorId: fixture.operator, legacyProjectId: id } };
     await api.put(approvalUrl(id)).set('Authorization', auth).send(approvalInput(nextCommit)).expect(200);
     const row = (index: number) => db.deployment.create({ data: {
       projectId: id, status: 'RUNNING', commitHash: nextCommit, hostPort: RESERVED_WORKLOAD_PORT,
       publicAddressIndex: index, containerId: 'a'.repeat(64),
     } });
     const older = await row(4_000_001);
+    await db.deployment.update({ where: { id: older.id }, data: { status: 'HEALTHCHECKING' } });
     const newer = await row(4_000_002);
     const permit = (index: number) => authorizePublicIngress(host, workloadAddress(index) + ':' + String(RESERVED_WORKLOAD_PORT), hosting, db);
     await db.project.update({ where: { id }, data: { activeDeploymentId: newer.id, routingOperation: 'PROMOTE',
