@@ -50,26 +50,31 @@ Both AWS demo applications were captured from their public HTTPS pages.
 
 ```mermaid
 flowchart LR
-    Operator["Operator browser"] -->|"SSH tunnel in AWS mode"| UI
-    Source["Public GitHub repository"]
-    Visitor["Public browser"] -.->|"Resolves project hostname"| DNS["Public DNS"]
-    Visitor -->|"HTTPS"| Proxy
+    subgraph External["Outside the host"]
+        Operator["Operator browser"]
+        Source["Public GitHub repository"]
+        DNS["Public DNS"]
+        Visitor["Public browser"]
+    end
 
     subgraph Host["One Docker host · Ubuntu EC2 in AWS mode"]
-        direction TB
-        UI["Next.js dashboard"] -->|"JWT-authenticated REST"| API["Express deployment services"]
-        API -->|"Scoped Socket.IO logs and status"| UI
-        API <-->|"Prisma"| DB[("PostgreSQL<br/>History, approvals and routing state")]
-        API -->|"Clone and verify revision"| Source
-        API -.->|"Verifies public DNS"| DNS
-        API -->|"Build, start and inspect"| Engine["Docker Engine"]
-        Engine --> Apps["Application containers<br/>Loopback-only bindings"]
-        API -->|"Direct HTTP health check"| Apps
-        API -->|"Route updates via private socket"| Proxy["Caddy reverse proxy"]
-        Proxy -->|"Ingress authorization via private socket"| API
-        Proxy -->|"Hostname routing after authorization"| Apps
+        UI["Next.js dashboard"] <-->|"JWT REST and Socket.IO"| API["Express API"]
+        API <-->|"Prisma"| DB[("PostgreSQL")]
+        API -->|"Build and run"| Engine["Docker Engine"]
+        Engine --> Apps["Application containers<br/>Loopback bindings"]
+        API -->|"Health check"| Apps
+        API <-->|"Private Unix sockets"| Proxy["Caddy"]
+        Proxy -->|"Authorized traffic"| Apps
     end
+
+    Operator -->|"SSH tunnel in AWS"| UI
+    Source -->|"Reviewed Git revision"| API
+    DNS -.->|"Verified DNS answers"| API
+    Visitor -.->|"Hostname lookup"| DNS
+    Visitor -->|"HTTPS"| Proxy
 ```
+
+PostgreSQL records deployment history, revision approvals, and routing state. The API updates Caddy routes over a private admin socket. Caddy checks ingress authorization through a separate socket before forwarding traffic to a container.
 
 ## Local mode and AWS mode
 
