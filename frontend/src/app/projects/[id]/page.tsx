@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 
 import { DeploymentLogsPanel } from "@/components/deployment-logs-panel";
@@ -92,6 +92,7 @@ export default function ProjectDetailsPage() {
 }
 
 function ProjectDetails({ projectId }: { projectId: string }) {
+  const router = useRouter();
   const { logout, token } = useAuth();
   const [project, setProject] = useState<Project | null>(null);
   const [deployments, setDeployments] = useState<Deployment[]>([]);
@@ -108,14 +109,24 @@ function ProjectDetails({ projectId }: { projectId: string }) {
   const [pendingRollbackId, setPendingRollbackId] = useState<string | null>(null);
   const [healthCheckPath, setHealthCheckPath] = useState("/");
   const [isSavingHealthCheck, setIsSavingHealthCheck] = useState(false);
+  const [isConfirmingDelete, setIsConfirmingDelete] = useState(false);
+  const [deleteName, setDeleteName] = useState("");
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const deleteNameInput = useRef<HTMLInputElement>(null);
+  const deleteInFlight = useRef(false);
   const [selectedDeploymentId, setSelectedDeploymentId] = useState<string | null>(
     null,
   );
   const requestId = useRef(0);
 
+  useEffect(() => {
+    if (isConfirmingDelete) deleteNameInput.current?.focus();
+  }, [isConfirmingDelete]);
+
   const loadProject = useCallback(
     async (signal?: AbortSignal, showLoading = true, selectedId?: string) => {
-      if (token === null) return;
+      if (token === null || deleteInFlight.current) return;
 
       const id = ++requestId.current;
       if (showLoading) setIsLoading(true);
@@ -238,7 +249,7 @@ function ProjectDetails({ projectId }: { projectId: string }) {
   const deploymentBusy =
     latestDeployment !== null && isDeploymentInProgress(latestDeployment.status);
   const actionsBusy =
-    pendingAction !== null || pendingRollbackId !== null || pendingApproval !== null || isSavingHealthCheck || deploymentBusy;
+    pendingAction !== null || pendingRollbackId !== null || pendingApproval !== null || isSavingHealthCheck || deploymentBusy || isDeleting;
   const publicHosting = project?.publicHostingEnabled === true;
   const approvalStatus = approval?.status === "APPROVED" && project?.approvalStatus !== "APPROVED"
     ? "UNKNOWN"
@@ -457,6 +468,30 @@ function ProjectDetails({ projectId }: { projectId: string }) {
     } finally {
       setIsSavingHealthCheck(false);
     }
+  };
+
+  const deleteProject = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (token === null || project === null || !isConfirmingDelete ||
+      deleteName !== project.name || actionsBusy || deleteInFlight.current) return;
+
+    deleteInFlight.current = true;
+    requestId.current += 1;
+    setIsDeleting(true);
+    setDeleteError(null);
+    try {
+      await projectApi.remove(token, project.id);
+    } catch (error: unknown) {
+      deleteInFlight.current = false;
+      setIsDeleting(false);
+      if (error instanceof ApiError && error.status === 401) {
+        logout();
+        return;
+      }
+      setDeleteError(error instanceof Error ? error.message : "The project could not be deleted.");
+      return;
+    }
+    router.replace("/dashboard");
   };
 
   const primaryAction = pendingAction === "deploy" || latestDeployment === null ? "deploy" : "redeploy";
@@ -859,7 +894,7 @@ function ProjectDetails({ projectId }: { projectId: string }) {
                   Deployment history
                 </h2>
                 <p className="mt-1 text-sm text-slate-500">
-                  Previous deployments remain available as a permanent project record.
+                  Review previous deployments for this project.
                 </p>
               </div>
 
@@ -961,6 +996,64 @@ function ProjectDetails({ projectId }: { projectId: string }) {
                     </tbody>
                   </table>
                 </div>
+              )}
+            </section>
+
+            <section aria-labelledby="danger-zone-title" className="mt-5 rounded-2xl border border-red-200 bg-white p-6 shadow-sm">
+              <h2 id="danger-zone-title" className="text-lg font-semibold tracking-tight text-red-900">
+                Danger Zone
+              </h2>
+              <p className="mt-2 text-sm leading-6 text-slate-700">
+                Deleting this project permanently removes its deployment history and associated resources,
+                including its containers, image tags, and hosting route. The original GitHub repository stays intact.
+              </p>
+              {isConfirmingDelete ? (
+                <form className="mt-4 space-y-4" onSubmit={(event) => void deleteProject(event)}>
+                  <div className="max-w-md">
+                    <label className="text-sm font-medium text-slate-900" htmlFor="delete-project-name">
+                      Type <strong className="break-words">{project.name}</strong> to confirm
+                    </label>
+                    <input
+                      autoCapitalize="none"
+                      autoComplete="off"
+                      className="form-input"
+                      disabled={isDeleting}
+                      id="delete-project-name"
+                      onChange={(event) => setDeleteName(event.target.value)}
+                      required
+                      ref={deleteNameInput}
+                      spellCheck={false}
+                      value={deleteName}
+                    />
+                  </div>
+                  {deleteError !== null && <p className="text-sm text-red-800" role="alert">{deleteError}</p>}
+                  <div className="flex flex-wrap gap-3">
+                    <button className="button-danger" disabled={token === null || actionsBusy || deleteName !== project.name} type="submit">
+                      {isDeleting ? "Deleting…" : "Permanently Delete Project"}
+                    </button>
+                    <button
+                      className="button-secondary"
+                      disabled={isDeleting}
+                      onClick={() => {
+                        setIsConfirmingDelete(false);
+                        setDeleteName("");
+                        setDeleteError(null);
+                      }}
+                      type="button"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <button
+                  className="button-danger mt-4"
+                  disabled={token === null || actionsBusy}
+                  onClick={() => setIsConfirmingDelete(true)}
+                  type="button"
+                >
+                  Delete Project
+                </button>
               )}
             </section>
           </>

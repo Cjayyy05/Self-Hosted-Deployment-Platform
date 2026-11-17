@@ -151,10 +151,10 @@ export class ApiError extends Error {
 
 type RequestOptions = RequestInit & { token?: string };
 
-const request = async <T>(
+const sendRequest = async (
   path: string,
   { token, headers: inputHeaders, ...options }: RequestOptions = {},
-): Promise<T> => {
+): Promise<Response> => {
   const headers = new Headers(inputHeaders);
 
   if (options.body !== undefined && !headers.has("Content-Type")) {
@@ -177,27 +177,27 @@ const request = async <T>(
     );
   }
 
-  const payload = (await response.json().catch(() => null)) as
-    | ErrorResponse
-    | T
-    | null;
-
   if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as ErrorResponse | null;
     const message =
       typeof payload === "object" &&
       payload !== null &&
-      "error" in payload &&
       typeof payload.error?.message === "string"
         ? payload.error.message
         : "The request could not be completed.";
     throw new ApiError(response.status, message);
   }
+  return response;
+};
 
+const request = async <T>(path: string, options?: RequestOptions): Promise<T> => {
+  const response = await sendRequest(path, options);
+  const payload = (await response.json().catch(() => null)) as T | null;
   if (payload === null) {
     throw new ApiError(500, "The server returned an invalid response.");
   }
 
-  return payload as T;
+  return payload;
 };
 
 export const authApi = {
@@ -257,6 +257,16 @@ export const projectApi = {
       { token, signal },
     );
     return response.project;
+  },
+
+  async remove(token: string, projectId: string): Promise<void> {
+    const response = await sendRequest(`/projects/${encodeURIComponent(projectId)}`, {
+      method: "DELETE",
+      token,
+    });
+    if (response.status !== 204) {
+      throw new ApiError(500, "The server did not confirm project deletion.");
+    }
   },
 
   async updateHealthCheckPath(
