@@ -97,7 +97,9 @@ export class DeploymentRoutingService {
     throw new AppError(503, 'The public Caddy port is no longer owned by its deployment');
   }
 
-  public async promote(candidate: Candidate, startedAt: Date, lease: ProjectOperationLease): Promise<Deployment> {
+  public async promote(
+    candidate: Candidate, startedAt: Date, lease: ProjectOperationLease, onDnsProgress?: (message: string) => void,
+  ): Promise<Deployment> {
     let committed: Deployment | undefined;
     let activationError: unknown;
     try {
@@ -113,7 +115,8 @@ export class DeploymentRoutingService {
         await this.health.waitUntilHealthy({ hostPort: target.port, path: pending.healthCheckPath,
           ...this.#healthAddress(target) });
       }
-      await this.#publish(pending, target, lease, false, true);
+      await this.#publish(pending, target, lease, false, true,
+        (hostname) => this.readiness.waitForDns(hostname, onDnsProgress));
       const previous = pending.activeDeploymentId;
       const retirement = previous === null || previous === candidate.id
         ? clearOperation
@@ -457,7 +460,10 @@ export class DeploymentRoutingService {
     }
   }
 
-  async #publish(project: RoutingProject, target: VerifiedTarget, lease: ProjectOperationLease, fence: boolean, verifyPublic = false) {
+  async #publish(
+    project: RoutingProject, target: VerifiedTarget, lease: ProjectOperationLease, fence: boolean, verifyPublic = false,
+    verifyDns = (hostname: string) => this.readiness.verifyDns(hostname),
+  ) {
     const publicMode = this.hosting.publicHosting !== undefined;
     const url = new URL(localProjectUrl(projectHostnameLabel(project.id), this.hosting));
     const authorizeWrite = async () => {
@@ -465,7 +471,7 @@ export class DeploymentRoutingService {
       await lease.assertValid();
     };
     await authorizeWrite();
-    if (publicMode && verifyPublic) await this.readiness.verifyDns(url.hostname);
+    if (publicMode && verifyPublic) await verifyDns(url.hostname);
     if (this.hosting.publicHosting !== undefined && target.deployment.hostPort !== target.port) {
       await this.db.$transaction(async (tx) => {
         await lease.assertValid(tx);

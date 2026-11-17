@@ -483,6 +483,7 @@ export class DeploymentService {
           { ...deployment, hostPort: restartedContainer.hostPort },
           this.#now(),
           requireRoutingLease(hostingLease),
+          (message) => { this.#emitLog(onEvent, deployment.id, 'deployment', message); },
         )
         : await this.#updateDeployment(deployment.id, {
         status: DeploymentStatus.RUNNING,
@@ -821,7 +822,8 @@ export class DeploymentService {
       if (routing !== undefined) {
         await this.#gitService.cleanup(repository.repositoryPath);
         repository = undefined;
-        deployment = await routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
+        deployment = await routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease),
+          (message) => { this.#emitLog(onEvent, deployment.id, 'deployment', message); });
       } else {
         await this.#policy.assertApproved(project, deployment.commitHash);
         await hostingLease?.assertValid();
@@ -1036,7 +1038,8 @@ export class DeploymentService {
           await this.#gitService.cleanup(repository.repositoryPath);
           repository = undefined;
         }
-        deployment = await routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease));
+        deployment = await routing.promote(deployment, this.#now(), requireRoutingLease(hostingLease),
+          (message) => { this.#emitLog(onEvent, deployment.id, 'deployment', message); });
       } else {
         await this.#policy.assertApproved(project, commitHash);
         await hostingLease?.assertValid();

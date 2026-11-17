@@ -14,6 +14,8 @@ import { io } from 'socket.io-client';
 import supertest from 'supertest';
 import { describe, expect, it, vi } from 'vitest';
 
+import type { SubscriptionResult } from '../src/realtime/deployment-socket.js';
+
 const exec = promisify(execFile);
 const projectId = '11111111-1111-4111-8111-111111111111';
 const operatorId = '22222222-2222-4222-8222-222222222222';
@@ -145,6 +147,7 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
     const { startPublicIngress } = await import('../src/services/public-ingress.service.js');
     const { readLinuxBootId } = await import('../src/utils/linux-boot.js');
     const { containerService, ContainerLifecyclePendingError } = await import('../src/services/container.service.js');
+    const { dockerBuildService } = await import('../src/services/docker-build.service.js');
     const { createServer } = await import('node:http');
     const admin = createCaddyAdminTransport(adminSocket);
     const server = createServer(createApp());
@@ -173,6 +176,11 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
     let step = 'initial setup';
     const fastHealth = new ApplicationHealthCheckService({ maxAttempts: 4, retryDelayMs: 200 });
     vi.spyOn(applicationHealthCheckService, 'waitUntilHealthy').mockImplementation((input) => fastHealth.waitUntilHealthy(input));
+    const temporaryDns = new PublicHostingReadinessService({ origin: 'https://' + suffix, hostnameSuffix: suffix, adminSocketPath: adminSocket }, {
+      resolve4: () => Promise.reject(Object.assign(new Error(), { code: 'ESERVFAIL' })),
+      resolve6: () => Promise.resolve([]),
+    });
+    const failDnsOnce = temporaryDns.verifyDns.bind(temporaryDns);
     const dns = vi.spyOn(PublicHostingReadinessService.prototype, 'verifyDns').mockResolvedValue();
 
     try {
@@ -299,18 +307,20 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       expect((await http('unknown.' + suffix)).status).toBe(404);
 
       step = 'Socket.IO subscription';
-      const socket = io('http://127.0.0.1:' + String(address.port), {
-        transports: ['websocket'], auth: { token: auth.slice(7) }, autoConnect: false, reconnection: false, timeout: 5000,
-      });
-      try {
-        await new Promise<void>((resolve, reject) => {
-          socket.once('connect', resolve).once('connect_error', reject).connect();
+      const subscribe = async (deploymentId: string): Promise<SubscriptionResult> => {
+        const socket = io('http://127.0.0.1:' + String(address.port), {
+          transports: ['websocket'], auth: { token: auth.slice(7) }, autoConnect: false, reconnection: false, timeout: 5000,
         });
-        expect(await socket.timeout(2000).emitWithAck('deployment:subscribe', { deploymentId: firstId }))
-          .toMatchObject({ ok: true });
-      } finally {
-        socket.close();
-      }
+        try {
+          await new Promise<void>((resolve, reject) => {
+            socket.once('connect', resolve).once('connect_error', reject).connect();
+          });
+          return await socket.timeout(2000).emitWithAck('deployment:subscribe', { deploymentId }) as SubscriptionResult;
+        } finally {
+          socket.close();
+        }
+      };
+      expect(await subscribe(firstId)).toMatchObject({ ok: true });
 
       step = 'failed candidate';
       await api.post('/api/deployments/' + firstId + '/redeploy').set('Authorization', auth)
@@ -324,9 +334,17 @@ describe.skipIf(process.platform !== 'linux' || process.env.DEPLOYFLOW_PHASE5B_S
       expect(await active()).toBe(firstId);
       expect((await https('/', host, ca)).body).toBe('v1');
       step = 'redeploy';
+      dns.mockImplementationOnce(failDnsOnce);
+      const build = vi.spyOn(dockerBuildService, 'buildImage');
       const redeploy = await monitorOther(action(firstId, 'redeploy'));
       expect(redeploy.status, JSON.stringify(redeploy.body)).toBe(201);
+      expect(build).toHaveBeenCalledOnce();
       const secondId = await active();
+      const subscription = await subscribe(secondId);
+      expect(subscription.ok).toBe(true);
+      const messages = subscription.ok ? subscription.logHistory?.map(({ message }) => message) : undefined;
+      expect(messages).toContain('Public DNS check 1/6 failed (ESERVFAIL). Retrying in 1s.');
+      expect(messages).toContain('Public DNS verified on check 2/6.');
       expect((await https('/', host, ca)).body).toBe('v2');
       await expectOtherServed();
       expect((await https(firstProbe, host, ca)).status).toBe(404);

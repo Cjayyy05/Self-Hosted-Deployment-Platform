@@ -27,6 +27,54 @@ describe('public hosting readiness', () => {
     await expect(readiness.verifyDns(hostname)).rejects.toMatchObject({ code: 'DNS' });
   });
 
+  it('rechecks both A records and AAAA after temporary resolver errors', async () => {
+    const dns = {
+      resolve4: vi.fn<(name: string) => Promise<string[]>>().mockResolvedValue(['192.0.2.10'])
+        .mockRejectedValueOnce(Object.assign(new Error(), { code: 'ESERVFAIL' })),
+      resolve6: vi.fn<(name: string) => Promise<string[]>>().mockResolvedValue([])
+        .mockResolvedValueOnce([]).mockRejectedValueOnce(Object.assign(new Error(), { code: 'ETIMEOUT' })),
+    };
+    const wait = vi.fn().mockResolvedValue(undefined);
+    const progress = vi.fn();
+    const readiness = new PublicHostingReadinessService(hosting, dns, undefined, wait);
+
+    await expect(readiness.waitForDns(hostname, progress)).resolves.toBeUndefined();
+    expect(dns.resolve4.mock.calls).toEqual([[dnsTarget], [hostname], [dnsTarget], [hostname], [dnsTarget], [hostname]]);
+    expect(dns.resolve6.mock.calls).toEqual([[hostname], [hostname], [hostname]]);
+    expect(wait.mock.calls).toEqual([[1_000], [2_000]]);
+    expect(progress.mock.calls).toEqual([
+      ['Public DNS check 1/6 failed (ESERVFAIL). Retrying in 1s.'],
+      ['Public DNS check 2/6 failed (ETIMEOUT). Retrying in 2s.'],
+      ['Public DNS verified on check 3/6.'],
+    ]);
+  });
+
+  it('stops after six attempts when an A answer stays missing', async () => {
+    const dns = { resolve4: vi.fn().mockResolvedValue([]), resolve6: vi.fn().mockResolvedValue([]) };
+    const wait = vi.fn().mockResolvedValue(undefined);
+    const progress = vi.fn();
+    const readiness = new PublicHostingReadinessService(hosting, dns, undefined, wait);
+
+    await expect(readiness.waitForDns(hostname, progress)).rejects.toMatchObject({ code: 'DNS', statusCode: 502 });
+    expect(dns.resolve6).toHaveBeenCalledTimes(6);
+    expect(wait.mock.calls).toEqual([[1_000], [2_000], [4_000], [8_000], [10_000]]);
+    expect(progress).toHaveBeenLastCalledWith('Public DNS checks exhausted after 6 attempts (missing A answer).');
+  });
+
+  it.each([
+    [['192.0.2.10', '192.0.2.11'], ['192.0.2.10'], []],
+    [['192.0.2.10'], ['192.0.2.10', '192.0.2.11'], []],
+    [['192.0.2.10'], ['192.0.2.10'], ['2001:db8::1']],
+  ])('rejects invalid DNS answers without retrying', async (reference, addresses, ipv6) => {
+    const dns = { resolve4: vi.fn().mockResolvedValueOnce(reference).mockResolvedValueOnce(addresses),
+      resolve6: vi.fn().mockResolvedValue(ipv6) };
+    const wait = vi.fn().mockResolvedValue(undefined);
+    const readiness = new PublicHostingReadinessService(hosting, dns, undefined, wait);
+
+    await expect(readiness.waitForDns(hostname)).rejects.toMatchObject({ code: 'DNS' });
+    expect(wait).not.toHaveBeenCalled();
+  });
+
   it('requires the exact health response and reports TLS, routing and application failures separately', async () => {
     const request = vi.fn<LocalHealthRequest>().mockResolvedValueOnce(204).mockResolvedValueOnce(302).mockResolvedValueOnce(503)
       .mockRejectedValueOnce(Object.assign(new Error(), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }))

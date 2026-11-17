@@ -24,20 +24,30 @@ export class PublicHostingReadinessError extends AppError {
 }
 
 const resolver = new Resolver({ timeout: 1_500, tries: 1 });
+const dnsRetryDelaysMs = [1_000, 2_000, 4_000, 8_000, 10_000];
+const transientDnsCodes = new Set(['ETIMEOUT', 'ESERVFAIL', 'EREFUSED', 'ECONNREFUSED', 'EAI_AGAIN', 'ENODATA', 'ENOTFOUND']);
 const missingRecord = (error: unknown) =>
   error instanceof Error && 'code' in error && error.code === 'ENODATA';
 type PublicDns = Record<'resolve4' | 'resolve6', (hostname: string) => Promise<string[]>>;
+
+class RetryableDnsError extends PublicHostingReadinessError {
+  constructor(public readonly reason: string) {
+    super('DNS');
+  }
+}
 
 export class PublicHostingReadinessService {
   constructor(
     private readonly hosting: HostingConfig,
     private readonly dns: PublicDns = resolver,
     private readonly request = requestLocalHealth,
+    private readonly waitBeforeDnsRetry: (milliseconds: number) => Promise<void> = sleep,
   ) {}
 
   public async verifyDns(hostname: string): Promise<void> {
+    let answers: [string[], string[], string[]];
     try {
-      const [reference, addresses, ipv6] = await Promise.all([
+      answers = await Promise.all([
         this.dns.resolve4(this.hosting.publicHosting?.dnsTarget ?? this.hosting.hostnameSuffix),
         this.dns.resolve4(hostname),
         this.dns.resolve6(hostname).catch((error: unknown) => {
@@ -45,13 +55,39 @@ export class PublicHostingReadinessService {
           return [];
         }),
       ]);
-      if (reference.length === 1 && addresses.length > 0 && addresses.every((ip) => ip === reference[0]) && ipv6.length === 0) {
-        return;
+    } catch (error: unknown) {
+      if (error instanceof Error && 'code' in error && typeof error.code === 'string' && transientDnsCodes.has(error.code)) {
+        throw new RetryableDnsError(error.code);
       }
-    } catch {
-      // Resolver failures and unexpected answers both prevent public readiness.
+      throw new PublicHostingReadinessError('DNS');
     }
-    throw new PublicHostingReadinessError('DNS');
+    const [reference, addresses, ipv6] = answers;
+    if (ipv6.length > 0 || reference.length > 1 ||
+      (reference.length === 1 && addresses.some((ip) => ip !== reference[0]))) {
+      throw new PublicHostingReadinessError('DNS');
+    }
+    if (reference.length === 0 || addresses.length === 0) throw new RetryableDnsError('missing A answer');
+  }
+
+  public async waitForDns(hostname: string, onProgress?: (message: string) => void): Promise<void> {
+    const maxAttempts = dnsRetryDelaysMs.length + 1;
+    for (let attempt = 1; ; attempt += 1) {
+      const check = `${String(attempt)}/${String(maxAttempts)}`;
+      try {
+        await this.verifyDns(hostname);
+        if (attempt > 1) onProgress?.(`Public DNS verified on check ${check}.`);
+        return;
+      } catch (error) {
+        if (!(error instanceof RetryableDnsError)) throw error;
+        const delay = dnsRetryDelaysMs[attempt - 1];
+        if (delay === undefined) {
+          onProgress?.(`Public DNS checks exhausted after ${String(maxAttempts)} attempts (${error.reason}).`);
+          throw error;
+        }
+        onProgress?.(`Public DNS check ${check} failed (${error.reason}). Retrying in ${String(delay / 1_000)}s.`);
+        await this.waitBeforeDnsRetry(delay);
+      }
+    }
   }
 
   public async verifyHttps(url: URL, path: string, waitForCertificate = false): Promise<void> {
