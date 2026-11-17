@@ -1,6 +1,6 @@
 # GitHub webhook auto-deploy
 
-DeployFlow can create a new deployment when GitHub reports a push to a project's configured branch. The webhook is repository-specific and requires no GitHub account token or broad account permissions.
+In local/private mode, DeployFlow can create a new deployment when GitHub reports a push to a project's configured branch. The webhook is repository-specific and requires no GitHub account token. Public AWS mode uses the operator's [approved-revision workflow](public-deployment.md).
 
 ## Server configuration
 

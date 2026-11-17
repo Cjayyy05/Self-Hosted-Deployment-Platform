@@ -2,24 +2,19 @@
 
 ## Requirements
 
-- Node.js 20 or newer.
+- Node.js 22, matching CI.
 - npm.
 - PostgreSQL.
 
 ## Run locally
 
+Copy `.env.example` to `.env` in `backend` before installing. Set `DATABASE_URL` to your local PostgreSQL database and replace `JWT_SECRET`.
+
 From the repository root:
 
 ```bash
 cd backend
-npm install
-copy .env.example .env
-```
-
-On macOS or Linux, replace `copy .env.example .env` with `cp .env.example .env`.
-Update `DATABASE_URL` in `.env` with the credentials for your local PostgreSQL database, then apply the committed migrations and start the API:
-
-```bash
+npm ci
 npm run prisma:migrate:deploy
 npm run dev
 ```
@@ -71,12 +66,12 @@ Passwords must contain 8 to 128 characters, including at least one letter and on
 
 All project endpoints require `Authorization: Bearer <token>`:
 
-- `POST /api/projects` creates a project from `name`, `repositoryUrl`, optional `branch`, and `containerPort`.
+- `POST /api/projects` creates a project from `name`, `repositoryUrl`, optional `branch`, `containerPort`, and optional `healthCheckPath`.
 - `GET /api/projects` lists the authenticated user's projects.
 - `GET /api/projects/:id` returns an owned project.
 - `DELETE /api/projects/:id` deletes an owned project.
 
-The branch defaults to `main`. Repository URLs must use the form `https://github.com/<owner>/<repository>`, and `containerPort` must be an integer from 1 through 65535 representing the application's internal container port. Repository cloning is not implemented yet.
+The branch defaults to `main` and the health-check path defaults to `/`. Repository URLs use the form `https://github.com/<owner>/<repository>`. The backend clones the repository when a deployment begins.
 
 ## Quality checks
 

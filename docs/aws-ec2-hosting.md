@@ -164,15 +164,15 @@ aws ssm start-session --target "<instance-id>" --region ap-southeast-2 --profile
 ## Public cutover after separate approvals
 
 1. Set up and verify [wildcard DNS](#one-time-dynv6-setup). After ingress is authorized, allow public TCP 80 and 443 and preserve the SSH `/32` rule.
-2. Set `APP_HOSTNAME_SUFFIX=apps.dpflw-demo.dynv6.net`, `APP_HOSTING_ORIGIN=https://apps.dpflw-demo.dynv6.net`, `APP_PUBLIC_DNS_TARGET=dpflw-demo.dynv6.net`, `APP_PUBLIC_HOSTING_ENABLED=true`, and `APP_PUBLIC_OPERATOR_ID` to the existing operator's UUID. Keep the original sockets, private binds, firewall, database and certificate storage. Approve each source revision before deploying and retain the prior approved revision during rollback testing.
+2. Set `APP_HOSTNAME_SUFFIX=apps.demo.example.net`, `APP_HOSTING_ORIGIN=https://apps.demo.example.net`, `APP_PUBLIC_DNS_TARGET=demo.example.net`, `APP_PUBLIC_HOSTING_ENABLED=true`, and `APP_PUBLIC_OPERATOR_ID` to the existing operator's UUID. Keep the original sockets, private binds, firewall, database and certificate storage. Approve each source revision before deploying and retain the prior approved revision during rollback testing.
 3. Stop the backend during the release switch. Validate `infra/caddy/public.json` with the installed Caddy version, install it as `/etc/deployflow/caddy.json`, restart `deployflow-caddy`, and start the verified backend. The bootstrap denies unknown hosts on both ports. Exact HTTPS routes supplied by the backend activate individual certificate management and HTTP redirects. Keep the bootstrap hostname-free, Caddy's default ACME challenge ports reachable, and certificate storage persistent. [Caddy Automatic HTTPS](https://caddyserver.com/docs/automatic-https)
 4. Confirm reconciliation restores the existing Hello World URL and active approved SHA. In the private dashboard, create a second project, approve a reviewed full SHA in **Public Hosting**, select that revision, and deploy it. From a separate network, confirm each hostname resolves to the current instance IPv4, redirects over HTTP, validates a trusted certificate with the exact SAN, and serves the expected response. Repeat while redeploying, stopping, restarting and revoking one app. Confirm that an unapproved wildcard name has no certificate or application route. From outside the SSH allowlist, connections to 22, 2019, 2375, 2376, 3000, 4000, 5432, 787 and 8080 should fail. Repeat the listener and route checks after a restart.
 
 ### One-time dynv6 setup
 
-The proposed record layout uses one IPv4 update target for all applications. Confirm in the authorized rollout that the zone apex can be used for this purpose and has no IPv6 address. In the `dpflw-demo.dynv6.net` zone, set the apex A record to the current EC2 public IPv4 and add `*.apps` as a CNAME to `dpflw-demo.dynv6.net.` Confirm that dynv6 accepts and serves this **nested** wildcard. The provider documents wildcard records generally. During Phase 2, the existing exact hostname and zone apex resolved over IPv4, and an unused app hostname returned NXDOMAIN. Support for the nested record remains a rollout check. If the UI rejects it, check whether the provider supports the nested owner via an authorized record API or an `apps` child zone. Pause the cutover if no wildcard solution works with the existing suffix. [dynv6 changelog](https://dynv6.com/docs/changelog), [dynv6 record API](https://dynv6.github.io/api-spec/)
+The proposed record layout uses one IPv4 update target for all applications. Confirm in the authorized rollout that the zone apex can be used for this purpose and has no IPv6 address. In the `demo.example.net` zone, set the apex A record to the current EC2 public IPv4 and add `*.apps` as a CNAME to `demo.example.net.` Confirm that dynv6 accepts and serves this **nested** wildcard. The provider documents wildcard records generally. During Phase 2, the existing exact hostname and zone apex resolved over IPv4, and an unused app hostname returned NXDOMAIN. Support for the nested record remains a rollout check. If the UI rejects it, check whether the provider supports the nested owner via an authorized record API or an `apps` child zone. Pause the cutover if no wildcard solution works with the existing suffix. [dynv6 changelog](https://dynv6.com/docs/changelog), [dynv6 record API](https://dynv6.github.io/api-spec/)
 
-Keep the existing exact Hello World record during the first comparison. An exact record can override the wildcard, so test the Hello World name alongside two unused `app-<uuid-without-hyphens>.apps.dpflw-demo.dynv6.net` names. After external verification, switch the exact record to the same IPv4-only CNAME target, or retire that exact record once the wildcard is confirmed to serve the same hostname. Check authoritative answers and two public recursive resolvers for the CNAME chain, a single current A address, no AAAA answers, and any applicable CAA constraints. If changing the apex would affect another service, use an IPv4-only reference hostname in the same zone and update that record through an authorized host-side record updater. Set `APP_PUBLIC_DNS_TARGET` to the chosen reference.
+Keep the existing exact Hello World record during the first comparison. An exact record can override the wildcard, so test the Hello World name alongside two unused `app-<uuid-without-hyphens>.apps.demo.example.net` names. After external verification, switch the exact record to the same IPv4-only CNAME target, or retire that exact record once the wildcard is confirmed to serve the same hostname. Check authoritative answers and two public recursive resolvers for the CNAME chain, a single current A address, no AAAA answers, and any applicable CAA constraints. If changing the apex would affect another service, use an IPv4-only reference hostname in the same zone and update that record through an authorized host-side record updater. Set `APP_PUBLIC_DNS_TARGET` to the chosen reference.
 
 ### Existing approvals and the private API
 
@@ -235,14 +235,14 @@ If an interrupted port change leaves a live route that disagrees with both datab
 
 ### Start EC2 and verify host recovery
 
-1. In the Sydney EC2 console, start `i-0e3acc2a37a75dc07`. Wait for **Running** and all status checks to pass. Record the **Public IPv4 address** from this instance's details. With an authorized AWS CLI profile, cross-check the same field.
+1. In the Sydney EC2 console, start `<instance-id>`. Wait for **Running** and all status checks to pass. Record the **Public IPv4 address** from this instance's details. With an authorized AWS CLI profile, cross-check the same field.
 
    ```powershell
-   aws ec2 describe-instances --region ap-southeast-2 --instance-ids i-0e3acc2a37a75dc07 --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress]' --output table
+   aws ec2 describe-instances --region ap-southeast-2 --instance-ids '<instance-id>' --query 'Reservations[0].Instances[0].[InstanceId,State.Name,PublicIpAddress]' --output table
    ```
 
-2. Connect as `ubuntu` at that IPv4 using the existing PEM and strict host-key checking. If the IPv4 changed, use `HostKeyAlias` pointing to the previously trusted `known_hosts` entry for this instance. Verify its ED25519 fingerprint is `SHA256:ZdQy3QZZhoCLe0vtMLo2OmfqZZ14jp2sQ7G13VkE7Ek`. Stop on a mismatch. Reopen the [private dashboard tunnels](#private-startup-and-operator-access) to the verified address.
-3. Confirm the data mount is backed by EBS volume `vol-030d18526253cca41` (its NVMe serial omits the hyphen) and filesystem UUID `cc22c868-8919-4307-a590-57f8f3d72e9a`. If it is missing or wrong, stop recovery before starting dependent services or writing data there. Do not initialize or format the volume.
+2. Connect as `ubuntu` at that IPv4 using the existing PEM and strict host-key checking. If the IPv4 changed, use `HostKeyAlias` pointing to the previously trusted `known_hosts` entry for this instance. Verify its ED25519 fingerprint is `<previously-verified-fingerprint>`. Stop on a mismatch. Reopen the [private dashboard tunnels](#private-startup-and-operator-access) to the verified address.
+3. Confirm the data mount is backed by EBS volume `<expected-ebs-volume-id>` (its NVMe serial omits the hyphen) and filesystem UUID `<expected-filesystem-uuid>`. If it is missing or wrong, stop recovery before starting dependent services or writing data there. Do not initialize or format the volume.
 
    ```sh
    findmnt -no SOURCE,UUID,TARGET --mountpoint /srv/deployflow
@@ -269,7 +269,7 @@ If an interrupted port change leaves a live route that disagrees with both datab
 
    ```sh
    curl -q -fsS --max-time 15 --get https://dynv6.com/api/update \
-     --data-urlencode 'zone=dpflw-demo.dynv6.net' \
+     --data-urlencode 'zone=demo.example.net' \
      --data-urlencode "ipv4=$current_ec2_ipv4" \
      --data-urlencode 'token@/etc/deployflow/dynv6-token'
    ```
@@ -277,8 +277,8 @@ If an interrupted port change leaves a live route that disagrees with both datab
 
    ```powershell
    $sites = @(
-     'dpflw-demo.dynv6.net',
-     'app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net',
+     'demo.example.net',
+     '<verified-app-hostname>',
      '<second-approved-hostname>'
    )
    foreach ($resolver in '1.1.1.1', '8.8.8.8') {
@@ -294,7 +294,7 @@ If an interrupted port change leaves a live route that disagrees with both datab
 From a workstation outside EC2, confirm HTTP redirects with **308** to the same hostname over HTTPS. Confirm HTTPS returns **200**, TLS verification succeeds, and the body contains `Hello World`.
 
 ```powershell
-$site = 'app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net'
+$site = '<verified-app-hostname>'
 curl.exe -4 -sS --max-time 15 -I "http://$site/"
 curl.exe -4 -fsS --max-time 15 -o NUL -w "HTTP %{http_code}, TLS verify %{ssl_verify_result}\n" "https://$site/"
 curl.exe -4 -fsS --max-time 15 "https://$site/" | Select-String -SimpleMatch 'Hello World'
@@ -303,7 +303,7 @@ curl.exe -4 -fsS --max-time 15 "https://$site/" | Select-String -SimpleMatch 'He
 In the browser's certificate viewer, check that the trusted issuer is Let's Encrypt, the SAN contains the exact approved hostname, and the validity dates cover the current time. Record the expiry. On a Linux workstation with OpenSSL, the following checks the chain and hostname. Use the public hostname so DNS is exercised.
 
 ```sh
-site=app-284547fd804e42f8a56f5a7e9a147e7f.apps.dpflw-demo.dynv6.net
+site='<verified-app-hostname>'
 openssl s_client -connect "$site:443" -servername "$site" -verify_hostname "$site" -verify_return_error -brief </dev/null
 openssl s_client -connect "$site:443" -servername "$site" -verify_hostname "$site" -verify_return_error </dev/null |
   openssl x509 -noout -issuer -dates -ext subjectAltName

@@ -1,351 +1,138 @@
 # DeployFlow
 
-DeployFlow is a self-hosted deployment platform for GitHub applications.
+DeployFlow is a self-hosted platform that turns trusted public GitHub repositories into Dockerized web applications. I built it to practice the full deployment lifecycle, from cloning and building a repository to publishing a healthy release over HTTPS and recovering from a failed replacement.
 
-It provides a focused, local-first workflow for turning a trusted public GitHub repository into a running Docker container. DeployFlow owns the clone, build, container lifecycle, health verification, deployment history, live events, and basic runtime visibility so those concerns do not have to be managed by hand for every test application.
+The AWS demonstration ran **Hello World** and **Minimax Tic Tac Toe** simultaneously on one Ubuntu EC2 instance, each with a stable URL and a Caddy-managed TLS certificate. The final application release to pass production acceptance was [`0ade47c`](https://github.com/Cjayyy05/Self-Hosted-Deployment-Platform/commit/0ade47c950f5097abf5c6274bf21a3564c960042). The demo websites may be offline when the EC2 instance is stopped.
 
-> DeployFlow is a portfolio project, not a production-ready hosting platform. See [Security model](#security-model) and [Current limitations](#current-limitations) before running it.
+## Screenshots
 
-## Key features
+These captures show a previous acceptance session. The dashboard shows two live HTTPS applications and a separate failed deployment attempt. The operator views have been cropped and redacted for publication.
 
-- Email/password authentication with signed JWT access tokens and operator-controlled registration.
-- Per-user project management for public GitHub repositories, branches, container ports, and health-check paths.
-- Deployment from an existing root `Dockerfile` without changing the repository.
-- Conservative Dockerfile-free detection for supported npm-based Node.js applications and selected Flask, FastAPI, and Streamlit layouts.
-- Docker image builds and container lifecycle management through Dockerode.
-- Docker-assigned host ports bound to `127.0.0.1` for local application access.
-- Health-gated deployments: a container is not marked `RUNNING` until its configured local HTTP path returns a `2xx` or `3xx` response.
-- Live deployment status and real Docker build output over authenticated, deployment-scoped Socket.IO rooms.
-- Current CPU usage, memory usage/limit, and uptime with five-second polling while a deployment is running.
-- Stop, health-checked restart, redeploy, and deployment history.
-- Safe replacement deployments: redeploy and rollback keep the current version running until its replacement is healthy.
-- Rollback as a new deployment, reusing the historical image when available or rebuilding the exact stored commit otherwise.
-- HMAC-verified GitHub push webhooks, branch/repository matching, and delivery-ID deduplication for automatic deployments.
-- GitHub Actions CI for backend and frontend validation on pull requests and selected branches.
+![DeployFlow dashboard showing two available applications and a third project with a failed attempt](docs/screenshots/dashboard.png)
+
+<details>
+<summary>Public Hosting, deployment logs, monitoring, and history</summary>
+
+**Public Hosting** shows AWS approval, certificate status, and lifecycle controls.
+
+![AWS Public Hosting panel with approval, certificate readiness, and deployment controls](docs/screenshots/public-hosting.png)
+
+**Deployment logs** show real Docker build output from a disposable local Hello World deployment.
+
+![Live deployment log panel showing Docker build output](docs/screenshots/deployment-logs.png)
+
+**Runtime monitoring** samples the running AWS container's CPU, memory usage and limit, and uptime.
+
+![AWS runtime monitoring panel showing current container metrics](docs/screenshots/runtime-monitoring.png)
+
+**Deployment history** shows the active release, previous attempts, and available rollback actions.
+
+![AWS deployment history table with running, failed, and stopped entries](docs/screenshots/deployment-history.png)
+
+</details>
+
+Both AWS demo applications were captured from their public HTTPS pages.
+
+| Hello World | Minimax Tic Tac Toe |
+| --- | --- |
+| ![Public Hello World page with Docker whale ASCII art](docs/screenshots/hello-world.jpg) | ![Public Minimax Tic Tac Toe page with an interactive game board](docs/screenshots/minimax-tic-tac-toe.jpg) |
+
+## What it does
+
+- Manage several GitHub applications from an authenticated dashboard. See the active deployment and the latest attempt independently.
+- Build from a root Dockerfile or generate a temporary one for supported npm, Flask, FastAPI, and Streamlit layouts. DeployFlow records the resolved Git commit.
+- Stream deployment progress and Docker build output over Socket.IO. Inspect recent container logs, CPU usage, memory usage and limit, uptime, and deployment history.
+- Stop, restart, redeploy, or roll back. A healthy active release stays in service during replacement. Rollback creates a new history entry using the saved image or exact commit.
+- Delete a project from **Danger Zone** by typing its exact name. Successful deletion withdraws its hosting route and removes its deployment history, containers, and project-specific image tags. The source on GitHub stays intact.
+- Publish approved revisions to separate HTTPS hostnames in AWS mode. Local/private mode also supports signed GitHub push webhooks for automatic replacement deployments.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    GitHub[Public GitHub repository] --> API[Express backend]
-    API --> Clone[Temporary Git clone]
-    Clone --> Detect[Dockerfile or app detection]
-    Detect --> Build[Docker image build]
-    Build --> Container[Docker container]
-    Container --> Health[Local HTTP health check]
-    Health --> App[Running application]
+    Operator["Operator browser"] -->|"SSH tunnel in AWS mode"| UI
+    Source["Public GitHub repository"]
+    Visitor["Public browser"] -.->|"Resolves project hostname"| DNS["Public DNS"]
+    Visitor -->|"HTTPS"| Proxy
 
-    UI[Next.js frontend] -->|REST + JWT| API
-    API -->|Socket.IO status and logs| UI
-    API <--> DB[(PostgreSQL)]
-    API <--> Docker[(Docker Engine)]
+    subgraph Host["One Docker host · Ubuntu EC2 in AWS mode"]
+        direction TB
+        UI["Next.js dashboard"] -->|"JWT-authenticated REST"| API["Express deployment services"]
+        API -->|"Scoped Socket.IO logs and status"| UI
+        API <-->|"Prisma"| DB[("PostgreSQL<br/>History, approvals and routing state")]
+        API -->|"Clone and verify revision"| Source
+        API -.->|"Verifies public DNS"| DNS
+        API -->|"Build, start and inspect"| Engine["Docker Engine"]
+        Engine --> Apps["Application containers<br/>Loopback-only bindings"]
+        API -->|"Direct HTTP health check"| Apps
+        API -->|"Route updates via private socket"| Proxy["Caddy reverse proxy"]
+        Proxy -->|"Ingress authorization via private socket"| API
+        Proxy -->|"Hostname routing after authorization"| Apps
+    end
 ```
 
-- **Frontend:** a Next.js App Router application for authentication, project configuration, deployment controls, live logs, history, webhook setup, and monitoring.
-- **Backend:** an Express API that validates ownership and coordinates Git, application detection, Docker builds, containers, health checks, rollback, and replacement deployments.
-- **PostgreSQL:** stores users, projects, deployments, rollback relationships, project-operation leases, and processed GitHub delivery IDs through Prisma.
-- **Socket.IO:** authenticates with the same JWT identity as REST, authorizes each deployment subscription, and broadcasts only to that deployment's room.
-- **Docker:** builds repository content, assigns a free loopback host port, runs applications, and supplies logs and runtime statistics.
+## Local mode and AWS mode
 
-The core deployment orchestration is kept in backend services. Docker, Git, health checks, and persistence remain independent of the HTTP and Socket.IO transport layers.
+| | Local / private | Public AWS hosting |
+| --- | --- | --- |
+| Management | Loopback dashboard and API with project ownership checks | Private dashboard and API through SSH forwarding, restricted to a configured operator |
+| Release selection | Configured branch tip for deploy/redeploy. Optional HMAC-verified, deduplicated GitHub push webhooks | Operator reviews and approves a full Git SHA. Deploy/redeploy use the selected approved SHA |
+| Serving traffic | Docker-assigned loopback port or optional stable Caddy HTTP hostname | Stable per-project hostname, automatic TLS, and HTTP-to-HTTPS redirect through Caddy |
 
-## Technology stack
+## GitHub to public HTTPS
 
-| Area | Technologies |
-| --- | --- |
-| Frontend | Next.js, React, TypeScript, Tailwind CSS |
-| Backend | Node.js, Express, TypeScript, Prisma, PostgreSQL, Socket.IO, Dockerode |
-| Infrastructure | Docker, Git, GitHub Actions |
-| Testing and quality | Vitest, Supertest, ESLint, TypeScript |
+1. Create a project with its public GitHub repository, branch, container port, and health-check path.
+2. Review the exact commit. In **Public Hosting**, approve its full SHA, select it, and deploy.
+3. The backend fetches and verifies that revision, builds an image with Docker, starts a container on a dedicated loopback binding, and checks application health.
+4. DeployFlow checks DNS and configures an exact-host Caddy route. Caddy obtains the certificate and authorizes ingress through a private socket. DeployFlow verifies trusted HTTPS to the candidate before marking it active and retiring the previous container.
+5. Once the dashboard verifies the route from the operator's browser, **Open website** and **Copy public URL** become available.
 
-## Deployment lifecycle
+See the [deployment walkthrough](docs/public-deployment.md) for prerequisites, failure behavior, and verification.
 
-The successful initial deployment flow is:
+## Run locally
 
-```text
-QUEUED -> CLONING -> BUILDING -> STARTING -> HEALTHCHECKING -> RUNNING
-```
+Use Node.js 22, npm, Git, Docker, and PostgreSQL. Copy [the backend environment example](backend/.env.example) to `backend/.env`, set `DATABASE_URL` for a local database, and generate an independent random `JWT_SECRET` of at least 32 bytes. Generate a separate webhook key if using auto-deploy.
 
-- `FAILED` is a terminal state when preparation, build, startup, or health checking fails.
-- `STOPPED` records a deployment whose container has been stopped; its history is retained.
-- Restart passes through `STARTING -> HEALTHCHECKING -> RUNNING` and fails if the application does not become healthy.
-- Redeploy creates a new record from the project's current repository and branch. Rollback also creates a new record from a selected successful deployment.
-- During redeploy or rollback, the current `RUNNING` deployment stays available until the replacement reaches `RUNNING`. Only then is the previous container stopped and its record changed to `STOPPED`.
-
-Docker assigns the host port dynamically. After startup, DeployFlow inspects the container, saves that port, and health-checks only `127.0.0.1:<hostPort>` using the project's application-relative path.
-
-## Supported application detection
-
-Detection follows a strict priority order:
-
-1. **Dockerfile:** a regular root `Dockerfile` is used unchanged.
-2. **Node.js:** a root `package.json` must be valid JSON and define a non-empty `scripts.start`. Generated images use Node 22, run `npm ci` when `package-lock.json` exists (otherwise `npm install`), optionally run `npm run build`, and start with `npm start`.
-3. **Python:** a root `requirements.txt` or standard, pip-installable `pyproject.toml` must identify exactly one supported layout:
-   - Flask with a root `app.py` and an `app` instance;
-   - FastAPI with `fastapi` and `uvicorn`, plus a root `main.py` and `app` instance;
-   - Streamlit with a root `app.py`.
-4. Anything else returns `Unsupported application type` rather than guessing a command.
-
-Generated Dockerfiles exist only inside the temporary clone. npm and pip installation, application build scripts, and launch commands run inside Docker—not directly on the DeployFlow host.
-
-## Screenshots
-
-### Dashboard
-
-<!-- Add the DeployFlow dashboard screenshot here. -->
-
-_Screenshot placeholder: project cards, latest deployment state, and project creation._
-
-### Project details
-
-<!-- Add the project details screenshot here. -->
-
-_Screenshot placeholder: repository configuration, deployment state, and lifecycle actions._
-
-### Live build logs
-
-<!-- Add the live build log screenshot here. -->
-
-_Screenshot placeholder: authenticated Socket.IO connection and real Docker build events._
-
-### Runtime monitoring
-
-<!-- Add the runtime monitoring screenshot here. -->
-
-_Screenshot placeholder: container state, CPU, memory, and uptime._
-
-### Deployment history
-
-<!-- Add the deployment history screenshot here. -->
-
-_Screenshot placeholder: deployment records, application types, timestamps, and rollback controls._
-
-## Local installation
-
-### Prerequisites
-
-- Node.js 20 or newer and npm.
-- Git.
-- Docker Desktop on Windows/macOS, or Docker Engine on Linux. The current user must be able to access the Docker daemon.
-- PostgreSQL, either installed locally or running in Docker.
-
-### 1. Clone the repository
-
-```powershell
-git clone <your-deployflow-repository-url>
-cd DeployFlow
-```
-
-The equivalent `git clone` and `cd` commands work in Bash or another shell.
-
-### 2. Start PostgreSQL
-
-If PostgreSQL is not already available, this local-only Docker example creates a database matching the sample connection string:
-
-```powershell
-docker run --name deployflow-postgres -e POSTGRES_USER=deployflow -e POSTGRES_PASSWORD=deployflow_dev -e POSTGRES_DB=deployflow -p 127.0.0.1:5432:5432 -d postgres:17-alpine
-```
-
-The credentials above are development examples. Choose different credentials for any non-local environment and update `DATABASE_URL` accordingly.
-
-### 3. Configure and install the backend
-
-Windows PowerShell:
-
-```powershell
+```sh
+# Terminal 1, from the repository root
 cd backend
-Copy-Item .env.example .env
-```
-
-Bash:
-
-```bash
-cd backend
-cp .env.example .env
-```
-
-Edit `backend/.env` before installing. At minimum, set the PostgreSQL connection and replace both secret placeholders with independent random values. For example, PowerShell can generate a 32-byte secret with:
-
-```powershell
-[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
-```
-
-Then install dependencies and prepare the database:
-
-```powershell
 npm ci
-npm run prisma:validate
-npm run prisma:generate
 npm run prisma:migrate:deploy
-```
-
-`prisma:migrate:deploy` applies the migrations already committed to the repository without resetting existing data. Confirm `DATABASE_URL` points to the intended database and back up persistent data before applying pending migrations. Stable hosting requires the project hostname and deployment routing migrations listed in the [local hosting guide](docs/local-hosting.md).
-
-### 4. Configure and install the frontend
-
-From the repository root, in a separate terminal:
-
-Windows PowerShell:
-
-```powershell
-cd frontend
-npm ci
-Copy-Item .env.example .env.local
-```
-
-Bash:
-
-```bash
-cd frontend
-npm ci
-cp .env.example .env.local
-```
-
-The sample frontend values work when the backend uses its default local address.
-
-### 5. Start DeployFlow
-
-Backend terminal:
-
-```powershell
-cd backend
 npm run dev
 ```
 
-Frontend terminal:
-
-```powershell
+```sh
+# Terminal 2, from the repository root
 cd frontend
+npm ci
 npm run dev -- --hostname 127.0.0.1
 ```
 
-Open [http://localhost:3000](http://localhost:3000). The backend health endpoint is [http://localhost:4000/api/health](http://localhost:4000/api/health).
+Open [the local dashboard](http://localhost:3000). Temporarily enable `REGISTRATION_ENABLED` and restart the backend to create the first local account, then disable registration again and restart. For stable local URLs, use the [local Caddy guide](docs/local-hosting.md).
 
-Registration is disabled by default. To create the first account, temporarily set `REGISTRATION_ENABLED=true`, restart the backend, register, then restore it to `false` and restart again. Existing users can still sign in while registration is disabled.
+## Stack and testing
 
-For stable local application URLs, start a dedicated loopback Caddy instance and configure its private admin socket using the [local hosting guide](docs/local-hosting.md). Sign in, select **Create Project**, and enter a trusted public GitHub repository, branch, and container port. Open the project, select **Deploy**, then select **Open Application** when hosting is **Available**. The project keeps its URL through redeployment and rollback.
-
-To shut down, let in-flight operations finish. Use **Stop** on any applications you want to take offline, then stop the frontend and backend, followed by Caddy and the PostgreSQL instance dedicated to DeployFlow. The [local hosting guide](docs/local-hosting.md) covers recovery and the difference between platform shutdown and application stop.
-
-## Environment variables
-
-Never commit `backend/.env` or `frontend/.env.local`. Both are ignored by the repository's Git configuration; use the checked-in example files as templates.
-
-### Backend (`backend/.env`)
-
-| Variable | Purpose | Example/default behavior |
-| --- | --- | --- |
-| `NODE_ENV` | Runtime mode | `development`, `test`, or `production` |
-| `PORT` | Backend HTTP and Socket.IO port | `4000` |
-| `BIND_HOST` | Backend bind address | `127.0.0.1` |
-| `DATABASE_URL` | PostgreSQL connection string used by Prisma | Local PostgreSQL URL; replace the sample password |
-| `JWT_SECRET` | HMAC key for access tokens | Required, random, and at least 32 bytes |
-| `JWT_EXPIRES_IN` | Access-token lifetime understood by `jose` | `1h` |
-| `REGISTRATION_ENABLED` | Enables or disables new account registration | `false` |
-| `GITHUB_WEBHOOK_SECRET_KEY` | Master key used to derive a stable per-project webhook secret | Independent random value of at least 32 bytes; webhooks are unavailable when omitted |
-| `PUBLIC_BASE_URL` | Public backend origin used to form webhook payload URLs | `http://localhost:4000`; use an HTTPS tunnel origin for real GitHub delivery |
-| `APP_HOSTING_ORIGIN` | Local HTTP origin used to derive reserved project addresses | `http://localhost:8080` |
-| `APP_HOSTNAME_SUFFIX` | DNS suffix for reserved project addresses | `localhost` |
-| `CADDY_ADMIN_SOCKET` | Opts into local hosting configuration using a private filesystem socket | Unset by default. See [Local hosting](docs/local-hosting.md). |
-
-### Frontend (`frontend/.env.local`)
-
-| Variable | Purpose | Local value |
-| --- | --- | --- |
-| `BACKEND_API_URL` | Server-side target for the `/backend-api/*` rewrite | `http://localhost:4000` |
-| `NEXT_PUBLIC_SOCKET_URL` | Browser-visible Socket.IO backend origin | `http://localhost:4000` |
-
-For webhook setup and secure-tunnel instructions, see [GitHub auto-deploy configuration](docs/github-auto-deploy.md).
-
-## Testing and quality checks
-
-Run backend checks from `backend/`:
-
-```powershell
-npm run prisma:generate
-npm run prisma:validate
-npm run typecheck
-npm run lint
-npm test
-npm run build
-```
-
-Run frontend checks from `frontend/`:
-
-```powershell
-npm run typecheck
-npm run lint
-npm run build
-```
-
-On Windows, if the default Turbopack production build exits while processing `src/app/globals.css`, use `npm run build -- --webpack` in `frontend`, followed by `npm run start -- --hostname 127.0.0.1`. Set `BACKEND_API_URL` and `NEXT_PUBLIC_SOCKET_URL` before building if you use non-default backend ports.
-
-The backend Vitest suite covers authentication, ownership boundaries, Git preparation, application detection, Docker build/container behavior, orchestration and cleanup, health checks, deployment routes, rollback/redeploy cutover rules, webhooks, and Socket.IO authorization using mocked infrastructure boundaries. The frontend currently has lint, strict TypeScript, and production-build checks; no frontend test runner is configured.
-
-The [GitHub Actions workflow](.github/workflows/ci.yml) runs the equivalent backend and frontend checks on pull requests and pushes to `main` or `stretch-features`. It uses test-only environment values and does not deploy DeployFlow.
-
-## Example deployment
-
-The small public [crccheck/docker-hello-world](https://github.com/crccheck/docker-hello-world) repository is useful for a local Docker smoke test:
-
-| Project setting | Value |
+| Area | Tools |
 | --- | --- |
-| Repository | `https://github.com/crccheck/docker-hello-world` |
-| Branch | `master` |
-| Container port | `8000` |
-| Health-check path | `/` |
+| Web | Next.js App Router, React, TypeScript, Tailwind CSS |
+| API and state | Node.js, Express, Socket.IO, Prisma, PostgreSQL |
+| Hosting | Git, Docker Engine and Dockerode, Caddy, Ubuntu/systemd, AWS EC2, dynv6 |
+| Quality | ESLint, strict TypeScript, Vitest, Supertest, Playwright, GitHub Actions |
 
-Create a project with those values, select **Deploy**, wait for `RUNNING`, and use **Open Application**. Docker chooses the host port; the test application should respond over HTTP with “Hello World.”
+GitHub Actions checks Prisma, lint, types, and builds for the relevant packages, runs backend tests, and verifies public hosting on disposable Linux with Docker, Caddy, and PostgreSQL. The separate Playwright suite includes dashboard flows, DNS status feedback, and typed confirmation and error handling for project deletion. See the [CI workflow](.github/workflows/ci.yml) and [browser test setup](frontend/README.md#dashboard-acceptance-tests).
 
-## GitHub webhook auto-deploy
+## Engineering decisions
 
-Each project details page exposes an owner-only payload URL and derived webhook secret. Configure that URL in the matching GitHub repository, select `application/json`, paste the secret, and enable only push events. DeployFlow verifies GitHub's SHA-256 HMAC signature, repository, configured branch, and delivery ID before creating a new replacement deployment.
+- **Failed replacements.** Health-check the candidate and verify its proxy route before retiring the active container. Persist unfinished routing operations in PostgreSQL so reconciliation can resolve an interrupted cutover.
+- **DNS during publication and monitoring.** Retry transient or missing DNS answers up to six checks during publication without rebuilding the candidate. For a running app, retry a transient resolver error and briefly show **Verifying DNS** when a recent check passed and the route and HTTPS checks still pass. Persistent transient errors show **DNS unverified** and disable the website actions until verification succeeds. Incompatible addresses fail verification immediately.
+- **Independent applications.** Give each project a stable hostname and serialize its lifecycle changes with a database-backed lease. Recovery and withdrawal use persisted deployment and routing state.
 
-A local backend is not reachable by GitHub directly. For manual testing, set `PUBLIC_BASE_URL` to the origin of a secure HTTPS tunnel that forwards to the backend. Follow the complete [GitHub webhook guide](docs/github-auto-deploy.md).
+## Security and limits
 
-## Security model
+DeployFlow is a single-host portfolio project for workloads the operator trusts. REST and Socket.IO enforce access controls. In AWS mode, the management services stay private, public ingress is denied by default, and recorded SHA approvals govern workload admission. Public workloads have resource and network restrictions, and privileged Docker and Caddy administration stays local.
 
-**DeployFlow currently assumes deployment repositories are trusted. It is not designed to safely execute arbitrary untrusted public code.**
+- Deploy only reviewed repositories. Docker daemon access is privileged, and container restrictions are insufficient for arbitrary untrusted code or unrestricted multi-tenant hosting.
+- The platform supports public GitHub repositories, one host, and platform-assigned hostnames. Private repositories, per-project custom domains, autoscaling, and high availability are outside scope.
+- Build-event replay is bounded and held in memory. Docker log retrieval is limited, and runtime metrics are current samples with no historical charts.
 
-Repository code is cloned, built, and run by the local Docker daemon. Docker daemon access is highly privileged: a process with control of that daemon can effectively control workloads and may be able to compromise the host. Keep the backend private, protect its environment files, restrict access to the Docker socket, and deploy only repositories reviewed by the operator.
-
-The current implementation limits repository URLs to public GitHub HTTPS URLs, invokes Git with argument arrays, binds application ports to loopback, validates health paths, scopes REST and Socket.IO access through project ownership, verifies webhook HMAC signatures, and cleans temporary/runtime resources on expected failure paths. These safeguards do not turn Docker into a hardened multi-tenant sandbox.
-
-## Current limitations
-
-- Self-hosted and local-first; the backend and deployed application ports bind to loopback by default.
-- Public GitHub HTTPS repositories only; private repository credentials are not supported.
-- Deployment repositories must be trusted by the operator.
-- Automatic detection is intentionally narrow: npm projects with a start script and specific root-level Flask, FastAPI, or Streamlit layouts.
-- The configured Node application must honor conventional `HOST` and `PORT` environment variables; custom startup layouts may need their own Dockerfile.
-- One Docker host and one backend process; there is no distributed queue, multi-host scheduler, or high-availability coordination.
-- Optional Caddy hosting gives each project a stable local HTTP URL. The dashboard shows the active deployment and the newest attempt separately. See [Local hosting](docs/local-hosting.md).
-- No Kubernetes, autoscaling, custom-domain routing, or managed TLS.
-- No production-grade sandboxing, container CPU/memory limits, network isolation policy, image scanning, or build quotas.
-- Live deployment events are not persisted or replayed. The logs panel receives only events emitted after it subscribes, although container logs can be retrieved through the API.
-- Runtime monitoring exposes current Docker statistics only; it does not store historical metrics.
-- Health checks support a local `GET` path with fixed retry behavior, not custom headers, methods, or response-body assertions.
-
-## Future improvements
-
-- Resource limits, build timeouts, network controls, and more robust Docker cleanup reconciliation.
-- A durable job queue and worker model for deployments and webhook processing.
-- Persisted build logs and historical metrics.
-- Private GitHub repository authentication with narrowly scoped credentials.
-- Reverse-proxy routing, custom domains, and TLS management.
-- Configurable health-check timing and richer readiness rules while preserving local-only targets.
-- Frontend component and browser-level automated tests.
-
-## Engineering highlights
-
-Building DeployFlow provided practical experience with:
-
-- Orchestrating multi-stage deployments across Git, Prisma, Docker builds, containers, and HTTP health checks.
-- Managing partial failures and cleanup without taking a healthy previous deployment offline.
-- Preserving immutable deployment history across redeploy and rollback workflows.
-- Streaming scoped real-time events while enforcing the same ownership boundary as REST.
-- Calculating and presenting live Docker CPU, memory, and uptime data.
-- Designing around privileged Docker access, trusted-code assumptions, webhook verification, input validation, and bounded health checks.
-- Testing service boundaries and lifecycle transitions with deterministic mocks, plus validating both applications in CI.
-
-For the complete product scope and explicit assumptions, see [SPEC.md](SPEC.md).
+See the [documentation index](docs/README.md), [product specification](SPEC.md), and [three-minute demo script](docs/demo-script.md).
