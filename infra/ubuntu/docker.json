@@ -1,0 +1,8 @@
+{
+  "data-root": "/srv/deployflow/docker",
+  "features": { "containerd-snapshotter": false },
+  "dns": ["1.1.1.1", "9.9.9.9"],
+  "ipv6": false,
+  "log-driver": "json-file",
+  "log-opts": { "max-size": "10m", "max-file": "3" }
+}

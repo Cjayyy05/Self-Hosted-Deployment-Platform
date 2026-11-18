@@ -1,6 +1,7 @@
 import type { RequestHandler } from 'express';
 
 import { verifyAccessToken } from '../services/token.service.js';
+import { assertPublicOperator } from '../services/public-application-policy.js';
 import { AppError } from '../utils/app-error.js';
 
 const BEARER_TOKEN_PATTERN = /^Bearer\s+(\S+)$/i;
@@ -14,11 +15,15 @@ export const authenticate: RequestHandler = async (request, _response, next) => 
     return;
   }
 
+  let userId: string;
   try {
-    request.auth = { userId: await verifyAccessToken(token) };
-    next();
+    userId = await verifyAccessToken(token);
   } catch {
     next(new AppError(401, 'Authentication required'));
+    return;
   }
+  assertPublicOperator(userId);
+  request.auth = { userId };
+  next();
 };
 

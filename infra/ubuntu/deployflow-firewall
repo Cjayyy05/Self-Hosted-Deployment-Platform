@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+
+# Install before starting Docker. Keep the Docker iptables backend enabled.
+install_rule() {
+    local command=$1 chain=$2
+    shift 2
+    if ! "$command" -w -C "$chain" "$@" 2>/dev/null; then
+        "$command" -w -I "$chain" 1 "$@"
+    fi
+}
+
+iptables -w -N DOCKER-USER 2>/dev/null || iptables -w -S DOCKER-USER >/dev/null
+install_rule iptables FORWARD -j DOCKER-USER
+for bridge in docker0 'br-+'; do
+    # Block new connections from builds and workloads to the host itself.
+    # Established replies to host-originated Caddy and health requests still work.
+    install_rule iptables INPUT -i "$bridge" -m conntrack --ctstate NEW,INVALID -j DROP
+    for network in 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16; do
+        install_rule iptables DOCKER-USER -i "$bridge" -d "$network" -m conntrack --ctstate NEW,INVALID -j DROP
+    done
+    install_rule ip6tables INPUT -i "$bridge" -m conntrack --ctstate NEW,INVALID -j DROP
+    install_rule ip6tables FORWARD -i "$bridge" -m conntrack --ctstate NEW,INVALID -j DROP
+done

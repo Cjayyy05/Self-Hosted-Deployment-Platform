@@ -1,4 +1,8 @@
+"use client";
+
 import Link from "next/link";
+
+import { useAuth } from "@/context/auth-context";
 
 const assurances = [
   "Your infrastructure",
@@ -7,6 +11,8 @@ const assurances = [
 ];
 
 export default function HomePage() {
+  const { registrationEnabled } = useAuth();
+
   return (
     <div className="flex flex-1 flex-col">
       <section className="relative overflow-hidden border-b border-slate-200 bg-white">
@@ -26,11 +32,13 @@ export default function HomePage() {
               focused workspace.
             </p>
             <div className="mt-9 flex flex-col gap-3 sm:flex-row">
-              <Link className="button-primary" href="/register">
-                Create an account
-                <span aria-hidden="true">→</span>
-              </Link>
-              <Link className="button-secondary" href="/login">
+              {registrationEnabled && (
+                <Link className="button-primary" href="/register">
+                  Create an account
+                  <span aria-hidden="true">→</span>
+                </Link>
+              )}
+              <Link className={registrationEnabled ? "button-secondary" : "button-primary"} href="/login">
                 Sign in
               </Link>
             </div>

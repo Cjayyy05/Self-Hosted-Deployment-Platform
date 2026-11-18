@@ -2,6 +2,15 @@ import { Buffer } from 'node:buffer';
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+const mode = vi.hoisted(() => ({ public: false }));
+
+vi.mock('../src/config/env.js', async (importOriginal) => {
+  const module = await importOriginal<typeof import('../src/config/env.js')>();
+  return { ...module, env: { ...module.env, get hosting() {
+    return mode.public ? { ...module.env.hosting, publicHosting: { operatorId: 'fixture' } } : module.env.hosting;
+  } } };
+});
+
 import {
   ContainerService,
   type DockerClient,
@@ -56,12 +65,14 @@ describe('ContainerService', () => {
   type MockedDocker = DockerClient & {
     createContainer: ReturnType<typeof vi.fn<DockerClient['createContainer']>>;
     getContainer: ReturnType<typeof vi.fn<DockerClient['getContainer']>>;
+    listContainers: ReturnType<typeof vi.fn<DockerClient['listContainers']>>;
   };
 
   let container: MockedContainer;
   let docker: MockedDocker;
 
   beforeEach(() => {
+    mode.public = false;
     container = {
       id: containerId,
       start: vi.fn<DockerContainer['start']>().mockResolvedValue(undefined),
@@ -94,10 +105,103 @@ describe('ContainerService', () => {
       getContainer: vi
         .fn<DockerClient['getContainer']>()
         .mockReturnValue(container),
+      listContainers: vi.fn<DockerClient['listContainers']>().mockResolvedValue([]),
     };
   });
 
-  it('creates and starts a container with a Docker-assigned host port', async () => {
+  describe('routing binding inspection', () => {
+    const input = { containerId, deploymentId, containerPort: 8080 };
+    const bindings = [{ HostIp: '127.0.0.1', HostPort: '49153' }];
+    const verified = {
+      ...runningInspectResult,
+      Config: { Labels: { 'deployflow.deployment-id': deploymentId } },
+      NetworkSettings: { Ports: { '8080/tcp': bindings } },
+    };
+
+    beforeEach(() => {
+      docker.modem = {
+        getSocketPath: () => process.platform === 'win32' ? '//./pipe/docker_engine' : '/var/run/docker.sock',
+      };
+      container.inspect.mockResolvedValue(verified);
+    });
+
+    it('uses the inspected binding from the verified running container', async () => {
+      await expect(new ContainerService(docker).inspectLoopbackRoutingPort(input)).resolves.toBe(49153);
+      expect(docker.getContainer).toHaveBeenCalledWith(containerId);
+    });
+
+    it.each([
+      { ...verified, Id: 'b'.repeat(64) },
+      { ...verified, Config: { Labels: {} } },
+      { ...verified, State: stoppedInspectResult.State },
+      { ...verified, State: { Status: 'paused', Running: true } },
+      { ...verified, State: { Status: 'restarting', Running: true } },
+      { ...verified, NetworkSettings: runningInspectResult.NetworkSettings },
+      { ...verified, NetworkSettings: { Ports: { '8080/tcp': [...bindings, ...bindings] } } },
+      { ...verified, NetworkSettings: { Ports: { '8080/tcp': [{ ...bindings[0], HostPort: '65536' }] } } },
+    ])('rejects an unsafe or invalid Docker inspection', async (details) => {
+      container.inspect.mockResolvedValue(details);
+      await expect(new ContainerService(docker).inspectLoopbackRoutingPort(input)).rejects.toThrow();
+    });
+
+    it('rejects short IDs and nonlocal Docker transports before inspecting', async () => {
+      const service = new ContainerService(docker);
+      await expect(service.inspectLoopbackRoutingPort({ ...input, containerId: 'a'.repeat(12) }))
+        .rejects.toThrow('full Docker container ID');
+      docker.modem = {};
+      await expect(service.inspectLoopbackRoutingPort(input)).rejects.toThrow('local Docker socket');
+      expect(docker.getContainer).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('shutdown ownership inspection', () => {
+    const restarting = {
+      Id: containerId,
+      Config: { Labels: { 'deployflow.deployment-id': deploymentId } },
+      State: { Status: 'restarting', Running: true },
+    };
+
+    it('verifies a restarting deployment without a published binding', async () => {
+      container.inspect.mockResolvedValue(restarting);
+      await expect(new ContainerService(docker).inspectOwnedDeploymentContainer(containerId.toUpperCase(), deploymentId))
+        .resolves.toEqual({ containerId, status: 'restarting', running: true });
+    });
+
+    it.each([
+      { ...restarting, Id: 'b'.repeat(64) },
+      { ...restarting, Config: { Labels: {} } },
+      { ...restarting, Config: { Labels: { 'deployflow.deployment-id': '33333333-3333-4333-8333-333333333333' } } },
+    ])('rejects unverified shutdown ownership', async (details) => {
+      container.inspect.mockResolvedValue(details);
+      await expect(new ContainerService(docker).inspectOwnedDeploymentContainer(containerId, deploymentId))
+        .rejects.toThrow('could not verify deployment container ownership');
+    });
+
+    it('rejects a short ID and treats an absent container as already gone', async () => {
+      const service = new ContainerService(docker);
+      await expect(service.inspectOwnedDeploymentContainer(containerId.slice(0, 12), deploymentId))
+        .rejects.toThrow('full Docker container ID');
+      expect(docker.getContainer).not.toHaveBeenCalled();
+      container.inspect.mockRejectedValue({ statusCode: 404 });
+      await expect(service.inspectOwnedDeploymentContainer(containerId, deploymentId)).resolves.toBeNull();
+    });
+  });
+
+  it.each([
+    { modeName: 'default or private hosting', publicMode: false, limits: {} },
+    {
+      modeName: 'Linux public hosting with zero approvals',
+      publicMode: true,
+      limits: {
+        Memory: 536_870_912,
+        MemorySwap: 536_870_912,
+        NanoCpus: 1_000_000_000,
+        PidsLimit: 128,
+        SecurityOpt: ['no-new-privileges:true'],
+      },
+    },
+  ])('starts a $modeName container with a Docker-assigned port and restart policy', async ({ publicMode, limits }) => {
+    mode.public = publicMode;
     const service = new ContainerService(docker);
 
     const result = await service.startContainer({
@@ -107,11 +211,20 @@ describe('ContainerService', () => {
     });
 
     expect(docker.createContainer).toHaveBeenCalledWith({
+      abortSignal: expect.any(AbortSignal) as unknown,
       name: `deployflow-deployment-${deploymentId}`,
       Image: 'deployflow/example:latest',
       ExposedPorts: { '8080/tcp': {} },
       HostConfig: {
-        PortBindings: { '8080/tcp': [{ HostPort: '' }] },
+        PortBindings: {
+          '8080/tcp': [{ HostIp: '127.0.0.1', HostPort: '' }],
+        },
+        LogConfig: {
+          Type: 'json-file',
+          Config: { 'max-size': '10m', 'max-file': '3' },
+        },
+        RestartPolicy: { Name: 'unless-stopped' },
+        ...limits,
       },
       Labels: { 'deployflow.deployment-id': deploymentId },
     });
@@ -141,7 +254,40 @@ describe('ContainerService', () => {
       statusCode: 422,
       message: 'Unable to create and start container',
     });
-    expect(container.remove).toHaveBeenCalledWith({ force: true });
+    expect(container.remove).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
+  });
+
+  it('cleans up a created container without starting it when the final authorization is denied', async () => {
+    await expect(new ContainerService(docker).startContainer({
+      imageIdentifier: 'fixture', containerPort: 8080, deploymentId,
+    }, () => Promise.reject(new Error('Approval was withdrawn')))).rejects.toThrow();
+    expect(container.start).not.toHaveBeenCalled();
+    expect(container.remove).toHaveBeenCalledExactlyOnceWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
+  });
+
+  it('verifies deployment ownership and the withdrawal fence before removing a container', async () => {
+    const fence = vi.fn<() => Promise<void>>().mockRejectedValueOnce(new Error('Caddy unavailable'))
+      .mockResolvedValue(undefined);
+    const service = new ContainerService(docker);
+    container.inspect.mockResolvedValueOnce({
+      ...runningInspectResult, Config: { Labels: { 'deployflow.deployment-id': 'unrelated' } },
+    });
+    await expect(service.removeDeploymentContainers(deploymentId, containerId, fence)).rejects.toThrow('ownership');
+    expect(fence).not.toHaveBeenCalled();
+    container.inspect.mockResolvedValueOnce({
+      ...runningInspectResult, Config: { Labels: { 'deployflow.deployment-id': deploymentId } },
+    });
+    await expect(service.removeDeploymentContainers(deploymentId, containerId, fence)).rejects.toThrow();
+    expect(container.remove).not.toHaveBeenCalled();
+    container.inspect.mockResolvedValueOnce({
+      ...runningInspectResult, Config: { Labels: { 'deployflow.deployment-id': deploymentId } },
+    }).mockRejectedValueOnce({ statusCode: 404 });
+    docker.listContainers.mockResolvedValueOnce([{ Id: containerId }]);
+    await expect(service.removeDeploymentContainers(deploymentId, null, fence)).resolves.toBeUndefined();
+    expect(docker.listContainers).toHaveBeenCalledWith({
+      all: true, filters: { label: ['deployflow.deployment-id=' + deploymentId] }, abortSignal: expect.any(AbortSignal) as unknown,
+    });
+    expect(container.remove).toHaveBeenCalledExactlyOnceWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
   });
 
   it('cleans up when Docker does not return an assigned host port', async () => {
@@ -162,7 +308,7 @@ describe('ContainerService', () => {
       statusCode: 500,
       message: 'Docker did not assign a host port',
     });
-    expect(container.remove).toHaveBeenCalledWith({ force: true });
+    expect(container.remove).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
   });
 
   it('rejects malformed Docker host ports and cleans up the container', async () => {
@@ -184,7 +330,7 @@ describe('ContainerService', () => {
       statusCode: 500,
       message: 'Docker returned an invalid host port',
     });
-    expect(container.remove).toHaveBeenCalledWith({ force: true });
+    expect(container.remove).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
   });
 
   it('stops without removing the container and returns its updated status', async () => {
@@ -195,6 +341,7 @@ describe('ContainerService', () => {
 
     expect(docker.getContainer).toHaveBeenCalledWith(containerId);
     expect(container.stop).toHaveBeenCalledOnce();
+    expect(container.stop).toHaveBeenCalledWith(expect.objectContaining({ t: 30 }));
     expect(container.remove).not.toHaveBeenCalled();
     expect(result).toEqual({
       containerId,
@@ -219,7 +366,19 @@ describe('ContainerService', () => {
     });
     await expect(service.removeContainer(containerId)).resolves.toBeUndefined();
     expect(container.restart).toHaveBeenCalledOnce();
-    expect(container.remove).toHaveBeenCalledWith({ force: true });
+    expect(container.restart).toHaveBeenCalledWith(expect.objectContaining({ t: 30 }));
+    expect(container.remove).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
+  });
+
+  it('preserves uncertain stop and restart outcomes after a disconnected Docker request', async () => {
+    const service = new ContainerService(docker);
+    const disconnected = Object.assign(new Error('Connection reset'), { code: 'ECONNRESET' });
+    container.stop.mockRejectedValueOnce(disconnected);
+    container.restart.mockRejectedValueOnce(disconnected);
+    const pending = { statusCode: 503, message: 'Docker lifecycle operation outcome is unconfirmed; verify container state before retrying' };
+    await expect(service.stopContainer(containerId)).rejects.toMatchObject(pending);
+    await expect(service.restartContainer(containerId, 8080)).rejects.toMatchObject(pending);
+    expect(container.remove).not.toHaveBeenCalled();
   });
 
   it('retrieves combined stdout and stderr logs', async () => {
@@ -241,6 +400,32 @@ describe('ContainerService', () => {
       timestamps: true,
       tail: 250,
     });
+  });
+
+  it('uses a bounded default tail and caps the log response size', async () => {
+    container.logs.mockResolvedValue('x'.repeat(2 * 1024 * 1024));
+    const service = new ContainerService(docker);
+
+    const logs = await service.getLogs(containerId);
+
+    expect(container.logs).toHaveBeenCalledWith({
+      stdout: true,
+      stderr: true,
+      follow: false,
+      timestamps: false,
+      tail: 1_000,
+    });
+    expect(Buffer.byteLength(logs, 'utf8')).toBeLessThanOrEqual(1024 * 1024);
+    expect(logs).toMatch(/^\[Earlier log output truncated\]/);
+  });
+
+  it('rejects an excessive log tail', async () => {
+    const service = new ContainerService(docker);
+
+    await expect(
+      service.getLogs(containerId, { tail: 10_001 }),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(container.logs).not.toHaveBeenCalled();
   });
 
   it('calculates current CPU and memory statistics', async () => {

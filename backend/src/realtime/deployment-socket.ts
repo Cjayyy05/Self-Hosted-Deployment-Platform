@@ -12,12 +12,23 @@ import {
   type DeploymentRecord,
 } from '../services/deployment.service.js';
 import { verifyAccessToken } from '../services/token.service.js';
+import { assertPublicOperator } from '../services/public-application-policy.js';
 
 const BEARER_TOKEN_PATTERN = /^Bearer\s+(\S+)$/i;
 const DEPLOYMENT_ROOM_PREFIX = 'deployment:';
+const MAX_LOG_DEPLOYMENTS = 32;
+const MAX_RECENT_LOGS = 100;
+const MAX_LOG_LENGTH = 2_048;
+const RECENT_LOG_LIFETIME_MS = 15 * 60_000;
+
+type RecentLog = {
+  source: 'deployment' | 'build';
+  message: string;
+  timestamp: number;
+};
 
 export type SubscriptionResult =
-  | { ok: true; room: string }
+  | { ok: true; room: string; logHistory?: RecentLog[] }
   | { ok: false; error: string };
 
 export type ClientToServerEvents = {
@@ -103,6 +114,7 @@ const getSubscriptionError = (error: unknown): string =>
 
 export class DeploymentSocketGateway {
   readonly #io: DeploymentSocketServer;
+  readonly #recentLogs = new Map<string, RecentLog[]>();
   readonly #verifyToken: (token: string) => Promise<string>;
   readonly #getDeploymentForUser: (
     userId: string,
@@ -143,12 +155,21 @@ export class DeploymentSocketGateway {
       return;
     }
 
+    let userId: string;
     try {
-      socket.data.userId = await this.#verifyToken(token);
-      next();
+      userId = await this.#verifyToken(token);
     } catch {
       next(new Error('Authentication required'));
+      return;
     }
+    try {
+      assertPublicOperator(userId);
+    } catch {
+      next(new Error('Public hosting management requires the configured operator'));
+      return;
+    }
+    socket.data.userId = userId;
+    next();
   }
 
   public broadcast(event: DeploymentEvent): void {
@@ -166,6 +187,7 @@ export class DeploymentSocketGateway {
         });
         break;
       case 'log':
+        this.#rememberLog(deploymentId, event.source, event.message);
         this.#io.to(room).emit('deployment:log', {
           deploymentId,
           source: event.source,
@@ -186,6 +208,26 @@ export class DeploymentSocketGateway {
     }
   }
 
+  #readRecentLogs(deploymentId: string, now: number): RecentLog[] | undefined {
+    const history = this.#recentLogs.get(deploymentId);
+    const lastLog = history?.at(-1);
+    return lastLog !== undefined && now - lastLog.timestamp < RECENT_LOG_LIFETIME_MS ? history : undefined;
+  }
+
+  #rememberLog(deploymentId: string, source: RecentLog['source'], message: string): void {
+    const timestamp = Date.now();
+    const history = this.#readRecentLogs(deploymentId, timestamp) ?? [];
+    history.push({ source, message: message.slice(0, MAX_LOG_LENGTH), timestamp });
+    if (history.length > MAX_RECENT_LOGS) history.shift();
+
+    this.#recentLogs.delete(deploymentId);
+    this.#recentLogs.set(deploymentId, history);
+    if (this.#recentLogs.size > MAX_LOG_DEPLOYMENTS) {
+      const oldest = this.#recentLogs.keys().next().value;
+      if (oldest !== undefined) this.#recentLogs.delete(oldest);
+    }
+  }
+
   async #subscribe(
     socket: DeploymentSocket,
     deploymentId: unknown,
@@ -198,7 +240,8 @@ export class DeploymentSocketGateway {
       );
       const room = `${DEPLOYMENT_ROOM_PREFIX}${deployment.id}`;
       await socket.join(room);
-      acknowledge?.({ ok: true, room });
+      const logHistory = this.#readRecentLogs(deployment.id, Date.now());
+      acknowledge?.({ ok: true, room, ...(logHistory === undefined ? {} : { logHistory }) });
     } catch (error: unknown) {
       acknowledge?.({ ok: false, error: getSubscriptionError(error) });
     }

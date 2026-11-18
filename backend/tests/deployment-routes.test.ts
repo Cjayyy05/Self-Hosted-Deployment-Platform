@@ -4,6 +4,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 const databaseMocks = vi.hoisted(() => ({
   projectFindUnique: vi.fn<(args: unknown) => Promise<unknown>>(),
   projectFindFirst: vi.fn<(args: unknown) => Promise<unknown>>(),
+  projectUpdateMany: vi.fn<(args: unknown) => Promise<{ count: number }>>(),
   deploymentCreate: vi.fn<(args: unknown) => Promise<unknown>>(),
   deploymentUpdate: vi.fn<(args: unknown) => Promise<unknown>>(),
   deploymentFindFirst: vi.fn<(args: unknown) => Promise<unknown>>(),
@@ -11,7 +12,10 @@ const databaseMocks = vi.hoisted(() => ({
 }));
 
 const infrastructureMocks = vi.hoisted(() => ({
+  waitUntilHealthy: vi.fn<(args: unknown) => Promise<void>>(),
+  prepareBuild: vi.fn<(args: unknown) => Promise<unknown>>(),
   prepareRepository: vi.fn<(args: unknown) => Promise<unknown>>(),
+  prepareRepositoryAtCommit: vi.fn<(args: unknown) => Promise<unknown>>(),
   cleanupRepository: vi.fn<(path: string) => Promise<void>>(),
   buildImage: vi.fn<
     (
@@ -20,6 +24,7 @@ const infrastructureMocks = vi.hoisted(() => ({
     ) => Promise<{ imageId: string; imageTag: string }>
   >(),
   removeImage: vi.fn<(imageIdentifier: string) => Promise<void>>(),
+  imageExists: vi.fn<(imageIdentifier: string) => Promise<boolean>>(),
   startContainer: vi.fn<(args: unknown) => Promise<unknown>>(),
   stopContainer: vi.fn<(containerId: string) => Promise<unknown>>(),
   restartContainer: vi.fn<
@@ -37,6 +42,7 @@ vi.mock('../src/config/database.js', () => ({
     project: {
       findUnique: databaseMocks.projectFindUnique,
       findFirst: databaseMocks.projectFindFirst,
+      updateMany: databaseMocks.projectUpdateMany,
     },
     deployment: {
       create: databaseMocks.deploymentCreate,
@@ -50,13 +56,28 @@ vi.mock('../src/config/database.js', () => ({
 vi.mock('../src/services/git-repository.service.js', () => ({
   gitRepositoryService: {
     prepareRepository: infrastructureMocks.prepareRepository,
+    prepareRepositoryAtCommit: infrastructureMocks.prepareRepositoryAtCommit,
     cleanup: infrastructureMocks.cleanupRepository,
+  },
+}));
+
+vi.mock('../src/services/application-detector.service.js', () => ({
+  applicationDetector: {
+    prepareBuild: infrastructureMocks.prepareBuild,
+  },
+}));
+
+vi.mock('../src/services/application-health-check.service.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../src/services/application-health-check.service.js')>(),
+  applicationHealthCheckService: {
+    waitUntilHealthy: infrastructureMocks.waitUntilHealthy,
   },
 }));
 
 vi.mock('../src/services/docker-build.service.js', () => ({
   dockerBuildService: {
     buildImage: infrastructureMocks.buildImage,
+    imageExists: infrastructureMocks.imageExists,
     removeImage: infrastructureMocks.removeImage,
   },
 }));
@@ -93,6 +114,7 @@ const project = {
   repositoryUrl: 'https://github.com/example/example-api',
   branch: 'main',
   containerPort: 8080,
+  healthCheckPath: '/health',
 };
 
 const createDeploymentRecord = (
@@ -101,6 +123,8 @@ const createDeploymentRecord = (
 ) => ({
   id,
   projectId,
+  rollbackSourceDeploymentId: null,
+  applicationType: null,
   commitHash: status === DeploymentStatus.QUEUED ? null : commitHash,
   status,
   containerId: status === DeploymentStatus.QUEUED ? null : containerId,
@@ -131,9 +155,17 @@ beforeEach(() => {
 
   databaseMocks.projectFindFirst.mockResolvedValue(project);
   databaseMocks.projectFindUnique.mockResolvedValue(project);
+  databaseMocks.projectUpdateMany.mockResolvedValue({ count: 1 });
   databaseMocks.deploymentCreate.mockImplementation((rawOptions) => {
-    const options = rawOptions as { data: { status: typeof DeploymentStatus.QUEUED } };
-    const deployment = createDeploymentRecord(newDeploymentId, options.data.status);
+    const options = rawOptions as {
+      data: Partial<ReturnType<typeof createDeploymentRecord>> & {
+        status: typeof DeploymentStatus.QUEUED;
+      };
+    };
+    const deployment = {
+      ...createDeploymentRecord(newDeploymentId, options.data.status),
+      ...options.data,
+    };
     records.set(newDeploymentId, deployment);
     return Promise.resolve(deployment);
   });
@@ -172,12 +204,30 @@ beforeEach(() => {
       branch: project.branch,
     },
   });
+  infrastructureMocks.prepareBuild.mockResolvedValue({
+    applicationType: 'DOCKERFILE',
+    generatedDockerfile: false,
+    framework: 'dockerfile',
+  });
+  infrastructureMocks.waitUntilHealthy.mockResolvedValue(undefined);
+  infrastructureMocks.prepareRepositoryAtCommit.mockResolvedValue({
+    repositoryPath: 'C:\\temp\\deployflow-route-test',
+    commitHash,
+    metadata: {
+      provider: 'github',
+      owner: 'example',
+      name: 'example-api',
+      repositoryUrl: project.repositoryUrl,
+      branch: project.branch,
+    },
+  });
   infrastructureMocks.cleanupRepository.mockResolvedValue(undefined);
   infrastructureMocks.buildImage.mockImplementation((_input, onOutput) => {
     onOutput?.({ stream: 'Successfully built image\n' });
     return Promise.resolve({ imageId, imageTag });
   });
   infrastructureMocks.removeImage.mockResolvedValue(undefined);
+  infrastructureMocks.imageExists.mockResolvedValue(true);
   infrastructureMocks.startContainer.mockResolvedValue({
     containerId,
     hostPort: 49_153,
@@ -215,6 +265,22 @@ beforeEach(() => {
 });
 
 describe('deployment REST endpoints', () => {
+  it('returns a conflict while another project operation holds the lease', async () => {
+    databaseMocks.projectUpdateMany.mockResolvedValueOnce({ count: 0 });
+
+    const response = await request(createApp())
+      .post(`/api/projects/${projectId}/deploy`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({
+      error: {
+        message: 'Another deployment operation is already active for this project',
+      },
+    });
+    expect(databaseMocks.deploymentCreate).not.toHaveBeenCalled();
+  });
+
   it('accepts a valid owned deployment request', async () => {
     const response = await request(createApp())
       .post(`/api/projects/${projectId}/deploy`)
@@ -375,6 +441,50 @@ describe('deployment REST endpoints', () => {
     expect(databaseMocks.deploymentCreate).not.toHaveBeenCalled();
     expect(infrastructureMocks.prepareRepository).not.toHaveBeenCalled();
     expect(infrastructureMocks.stopContainer).not.toHaveBeenCalled();
+  });
+
+  it('creates a new owned rollback deployment through the REST endpoint', async () => {
+    const response = await request(createApp())
+      .post(`/api/deployments/${oldDeploymentId}/rollback`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(201);
+    expect(response.body).toMatchObject({
+      deployment: {
+        id: newDeploymentId,
+        projectId,
+        rollbackSourceDeploymentId: oldDeploymentId,
+        commitHash,
+        status: DeploymentStatus.RUNNING,
+      },
+    });
+    expect(databaseMocks.deploymentFindFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: oldDeploymentId, project: { userId } },
+      }),
+    );
+    expect(infrastructureMocks.imageExists).toHaveBeenCalledWith(imageId);
+    expect(infrastructureMocks.startContainer).toHaveBeenCalledWith({
+      imageIdentifier: imageId,
+      containerPort: project.containerPort,
+      deploymentId: newDeploymentId,
+    });
+  });
+
+  it('rejects an unauthorized rollback before creating a deployment', async () => {
+    databaseMocks.deploymentFindFirst.mockResolvedValue(null);
+
+    const response = await request(createApp())
+      .post(`/api/deployments/${oldDeploymentId}/rollback`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(404);
+    expect(response.body).toEqual({
+      error: { message: 'Deployment not found' },
+    });
+    expect(databaseMocks.deploymentCreate).not.toHaveBeenCalled();
+    expect(infrastructureMocks.imageExists).not.toHaveBeenCalled();
+    expect(infrastructureMocks.startContainer).not.toHaveBeenCalled();
   });
 
   it('checks deployment ownership before returning metrics', async () => {

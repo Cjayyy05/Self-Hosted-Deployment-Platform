@@ -6,29 +6,80 @@ const databaseMocks = vi.hoisted(() => ({
   deleteMany: vi.fn<(args: unknown) => Promise<{ count: number }>>(),
   findFirst: vi.fn<(args: unknown) => Promise<unknown>>(),
   findMany: vi.fn<(args: unknown) => Promise<unknown[]>>(),
+  updateMany: vi.fn<(args: unknown) => Promise<{ count: number }>>(),
+  findDeployments: vi.fn<(args: unknown) => Promise<unknown[]>>(),
+}));
+
+const dockerMocks = vi.hoisted(() => ({
+  imageExists: vi.fn<(image: string) => Promise<boolean>>(),
+  inspectStatus: vi.fn<(containerId: string) => Promise<{ running: boolean }>>(),
+  removeContainer: vi.fn<(containerId: string) => Promise<void>>(),
+  removeImage: vi.fn<(image: string) => Promise<void>>(),
+  stopContainer: vi.fn<(containerId: string) => Promise<unknown>>(),
 }));
 
 vi.mock('../src/config/database.js', () => ({
   database: {
     project: databaseMocks,
+    deployment: { findMany: databaseMocks.findDeployments },
+  },
+}));
+
+vi.mock('../src/services/container.service.js', () => ({
+  containerService: {
+    inspectStatus: dockerMocks.inspectStatus,
+    removeContainer: dockerMocks.removeContainer,
+    stopContainer: dockerMocks.stopContainer,
+  },
+}));
+
+vi.mock('../src/services/docker-build.service.js', () => ({
+  dockerBuildService: {
+    imageExists: dockerMocks.imageExists,
+    removeImage: dockerMocks.removeImage,
+  },
+}));
+
+vi.mock('../src/services/project-operation-lock.service.js', () => ({
+  projectOperationLockService: {
+    runExclusive: (_projectId: string, operation: () => Promise<unknown>) =>
+      operation(),
   },
 }));
 
 import { createApp } from '../src/app.js';
 import { createAccessToken } from '../src/services/token.service.js';
 
+vi.hoisted(() => {
+  process.env.CADDY_ADMIN_SOCKET = '';
+});
+
 const userId = '352bd66d-41b7-4c0d-a148-8a236647677b';
 const projectId = 'a382fb3d-dce4-4470-8e41-89a181466ce8';
 const now = new Date('2026-09-03T00:00:00.000Z');
 const project = {
   id: projectId,
+  hostnameLabel: 'app-a382fb3ddce444708e4189a181466ce8',
   userId,
   name: 'Example API',
   repositoryUrl: 'https://github.com/example/example-api',
   branch: 'main',
   containerPort: 3000,
+  healthCheckPath: '/',
   createdAt: now,
   updatedAt: now,
+};
+const hostingFields = {
+  localApplicationUrl: null,
+  hostingStatus: 'DISABLED',
+  activeDeployment: null,
+  latestDeployment: null,
+};
+const projectWithHostingRelations = {
+  ...project,
+  activeDeployment: null,
+  deployments: [],
+  routingOperation: null,
 };
 
 let authorization: string;
@@ -42,6 +93,19 @@ beforeEach(() => {
   databaseMocks.deleteMany.mockReset();
   databaseMocks.findFirst.mockReset();
   databaseMocks.findMany.mockReset();
+  databaseMocks.updateMany.mockReset();
+  databaseMocks.findDeployments.mockReset();
+  dockerMocks.imageExists.mockReset();
+  dockerMocks.inspectStatus.mockReset();
+  dockerMocks.removeContainer.mockReset();
+  dockerMocks.removeImage.mockReset();
+  dockerMocks.stopContainer.mockReset();
+  databaseMocks.findDeployments.mockResolvedValue([]);
+  dockerMocks.imageExists.mockResolvedValue(false);
+  dockerMocks.inspectStatus.mockResolvedValue({ running: false });
+  dockerMocks.removeContainer.mockResolvedValue(undefined);
+  dockerMocks.removeImage.mockResolvedValue(undefined);
+  dockerMocks.stopContainer.mockResolvedValue(undefined);
 });
 
 describe('POST /api/projects', () => {
@@ -61,6 +125,7 @@ describe('POST /api/projects', () => {
     expect(response.body).toEqual({
       project: {
         ...project,
+        ...hostingFields,
         createdAt: now.toISOString(),
         updatedAt: now.toISOString(),
       },
@@ -69,12 +134,16 @@ describe('POST /api/projects', () => {
       data: Record<string, unknown>;
       select: unknown;
     };
+    expect(createArgs.data.id).toMatch(/^[a-f0-9-]{36}$/);
     expect(createArgs.data).toEqual({
+      id: createArgs.data.id,
+      hostnameLabel: 'app-' + String(createArgs.data.id).replaceAll('-', ''),
       userId,
       name: 'Example API',
       repositoryUrl: 'https://github.com/example/example-api',
       branch: 'main',
       containerPort: 3000,
+      healthCheckPath: '/',
     });
     expect(createArgs.select).toBeDefined();
   });
@@ -115,6 +184,47 @@ describe('POST /api/projects', () => {
     expect(databaseMocks.create).not.toHaveBeenCalled();
   });
 
+  it('accepts an application-relative health-check path', async () => {
+    databaseMocks.create.mockResolvedValue({
+      ...project,
+      healthCheckPath: '/api/health',
+    });
+
+    const response = await request(createApp())
+      .post('/api/projects')
+      .set('Authorization', authorization)
+      .send({
+        name: 'Example API',
+        repositoryUrl: 'https://github.com/example/example-api',
+        containerPort: 3000,
+        healthCheckPath: '/api/health',
+      });
+
+    expect(response.status).toBe(201);
+    const createArgs = databaseMocks.create.mock.calls[0]?.[0] as {
+      data: Record<string, unknown>;
+    };
+    expect(createArgs.data.healthCheckPath).toBe('/api/health');
+  });
+
+  it.each(['https://example.com', '//evil.com', 'ftp://example.com'])(
+    'rejects external health-check target %s',
+    async (healthCheckPath) => {
+      const response = await request(createApp())
+        .post('/api/projects')
+        .set('Authorization', authorization)
+        .send({
+          name: 'Example API',
+          repositoryUrl: 'https://github.com/example/example-api',
+          containerPort: 3000,
+          healthCheckPath,
+        });
+
+      expect(response.status).toBe(400);
+      expect(databaseMocks.create).not.toHaveBeenCalled();
+    },
+  );
+
   it('rejects unauthenticated access', async () => {
     const response = await request(createApp()).post('/api/projects').send({
       name: 'Example API',
@@ -132,7 +242,7 @@ describe('POST /api/projects', () => {
 
 describe('GET /api/projects', () => {
   it('lists only projects belonging to the authenticated user', async () => {
-    databaseMocks.findMany.mockResolvedValue([project]);
+    databaseMocks.findMany.mockResolvedValue([projectWithHostingRelations]);
 
     const response = await request(createApp())
       .get('/api/projects')
@@ -143,6 +253,7 @@ describe('GET /api/projects', () => {
       projects: [
         {
           ...project,
+          ...hostingFields,
           createdAt: now.toISOString(),
           updatedAt: now.toISOString(),
         },
@@ -157,17 +268,43 @@ describe('GET /api/projects', () => {
 
 describe('GET /api/projects/:id', () => {
   it('returns an owned project', async () => {
-    databaseMocks.findFirst.mockResolvedValue(project);
+    databaseMocks.findFirst.mockResolvedValue(projectWithHostingRelations);
 
     const response = await request(createApp())
       .get(`/api/projects/${projectId}`)
       .set('Authorization', authorization);
 
     expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ project: hostingFields });
     const getArgs = databaseMocks.findFirst.mock.calls[0]?.[0] as {
       where: Record<string, unknown>;
     };
     expect(getArgs.where).toEqual({ id: projectId, userId });
+  });
+
+  it('returns separate active and latest summaries without internal routing fields', async () => {
+    const active = { id: 'active', status: 'RUNNING', commitHash: 'first', createdAt: now };
+    const latest = { id: 'latest', status: 'FAILED', commitHash: 'second', createdAt: now };
+    databaseMocks.findFirst.mockResolvedValue({
+      ...projectWithHostingRelations,
+      activeDeployment: { ...active, hostPort: 35000 },
+      deployments: [latest],
+    });
+
+    const response = await request(createApp()).get(`/api/projects/${projectId}`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({
+      project: {
+        ...project,
+        ...hostingFields,
+        activeDeployment: { ...active, createdAt: now.toISOString() },
+        latestDeployment: { ...latest, createdAt: now.toISOString() },
+        createdAt: now.toISOString(),
+        updatedAt: now.toISOString(),
+      },
+    });
   });
 
   it("does not expose another user's project", async () => {
@@ -188,8 +325,41 @@ describe('GET /api/projects/:id', () => {
   });
 });
 
+describe('PATCH /api/projects/:id', () => {
+  it('updates the health-check path for an owned project', async () => {
+    const updatedProject = { ...projectWithHostingRelations, healthCheckPath: '/health' };
+    databaseMocks.updateMany.mockResolvedValue({ count: 1 });
+    databaseMocks.findFirst.mockResolvedValue(updatedProject);
+
+    const response = await request(createApp())
+      .patch(`/api/projects/${projectId}`)
+      .set('Authorization', authorization)
+      .send({ healthCheckPath: '/health' });
+
+    expect(response.status).toBe(200);
+    expect(databaseMocks.updateMany).toHaveBeenCalledWith({
+      where: { id: projectId, userId },
+      data: { healthCheckPath: '/health' },
+    });
+    expect(response.body).toMatchObject({
+      project: { id: projectId, healthCheckPath: '/health' },
+    });
+  });
+
+  it('rejects an external URL before updating the project', async () => {
+    const response = await request(createApp())
+      .patch(`/api/projects/${projectId}`)
+      .set('Authorization', authorization)
+      .send({ healthCheckPath: 'https://example.com' });
+
+    expect(response.status).toBe(400);
+    expect(databaseMocks.updateMany).not.toHaveBeenCalled();
+  });
+});
+
 describe('DELETE /api/projects/:id', () => {
   it('deletes an owned project', async () => {
+    databaseMocks.findFirst.mockResolvedValue(project);
     databaseMocks.deleteMany.mockResolvedValue({ count: 1 });
 
     const response = await request(createApp())
@@ -203,7 +373,7 @@ describe('DELETE /api/projects/:id', () => {
   });
 
   it("does not delete another user's project", async () => {
-    databaseMocks.deleteMany.mockResolvedValue({ count: 0 });
+    databaseMocks.findFirst.mockResolvedValue(null);
 
     const response = await request(createApp())
       .delete(`/api/projects/${projectId}`)
@@ -213,8 +383,52 @@ describe('DELETE /api/projects/:id', () => {
     expect(response.body).toEqual({
       error: { message: 'Project not found' },
     });
-    expect(databaseMocks.deleteMany).toHaveBeenCalledWith({
-      where: { id: projectId, userId },
+    expect(databaseMocks.deleteMany).not.toHaveBeenCalled();
+  });
+
+  it('stops and removes running project containers before deletion', async () => {
+    databaseMocks.findFirst.mockResolvedValue(project);
+    databaseMocks.findDeployments.mockResolvedValue([
+      { containerId: 'a'.repeat(64), imageTag: 'deployflow/project/image-a' },
+      { containerId: 'b'.repeat(64), imageTag: 'deployflow/project/image-b' },
+    ]);
+    dockerMocks.inspectStatus
+      .mockResolvedValueOnce({ running: true })
+      .mockResolvedValueOnce({ running: false });
+    dockerMocks.imageExists.mockResolvedValue(true);
+    databaseMocks.deleteMany.mockResolvedValue({ count: 1 });
+
+    const response = await request(createApp())
+      .delete(`/api/projects/${projectId}`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(204);
+    expect(dockerMocks.stopContainer).toHaveBeenCalledOnce();
+    expect(dockerMocks.stopContainer).toHaveBeenCalledWith('a'.repeat(64));
+    expect(dockerMocks.removeContainer).toHaveBeenCalledTimes(2);
+    expect(dockerMocks.removeImage).toHaveBeenCalledTimes(2);
+    expect(databaseMocks.deleteMany).toHaveBeenCalledOnce();
+  });
+
+  it('keeps the project record when Docker cleanup fails', async () => {
+    databaseMocks.findFirst.mockResolvedValue(project);
+    databaseMocks.findDeployments.mockResolvedValue([
+      { containerId: 'a'.repeat(64), imageTag: null },
+    ]);
+    dockerMocks.inspectStatus.mockResolvedValue({ running: true });
+    dockerMocks.stopContainer.mockRejectedValue(new Error('Docker unavailable'));
+
+    const response = await request(createApp())
+      .delete(`/api/projects/${projectId}`)
+      .set('Authorization', authorization);
+
+    expect(response.status).toBe(502);
+    expect(response.body).toEqual({
+      error: {
+        message:
+          'Project Docker resources could not be cleaned up; the project was not deleted',
+      },
     });
+    expect(databaseMocks.deleteMany).not.toHaveBeenCalled();
   });
 });

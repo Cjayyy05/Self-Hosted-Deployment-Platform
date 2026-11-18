@@ -1,20 +1,17 @@
 import Link from "next/link";
 
-import type { Deployment, Project } from "@/lib/api";
+import { ProjectHosting } from "@/components/project-hosting";
+import type { Project } from "@/lib/api";
 import {
   DEPLOYMENT_STATUS_LABELS,
   DEPLOYMENT_STATUS_STYLES,
   formatDateTime,
 } from "@/lib/deployments";
 
-export type ProjectWithLatestDeployment = Project & {
-  latestDeployment: Deployment | null;
-};
-
 const repositoryName = (repositoryUrl: string): string =>
   repositoryUrl.replace(/^https:\/\/github\.com\//, "");
 
-export function ProjectCard({ project }: { project: ProjectWithLatestDeployment }) {
+export function ProjectCard({ project }: { project: Project }) {
   const latest = project.latestDeployment;
 
   return (
@@ -36,17 +33,6 @@ export function ProjectCard({ project }: { project: ProjectWithLatestDeployment 
             <span className="sr-only"> (opens in a new tab)</span>
           </a>
         </div>
-        {latest === null ? (
-          <span className="shrink-0 rounded-full border border-slate-200 bg-slate-100 px-2.5 py-1 text-xs font-semibold text-slate-600">
-            Not deployed
-          </span>
-        ) : (
-          <span
-            className={`shrink-0 rounded-full border px-2.5 py-1 text-xs font-semibold ${DEPLOYMENT_STATUS_STYLES[latest.status]}`}
-          >
-            {DEPLOYMENT_STATUS_LABELS[latest.status]}
-          </span>
-        )}
       </div>
 
       <dl className="mt-7 grid grid-cols-2 gap-4 border-y border-slate-100 py-5">
@@ -68,20 +54,36 @@ export function ProjectCard({ project }: { project: ProjectWithLatestDeployment 
         </div>
       </dl>
 
-      <div className="mt-auto pt-5">
+      <div className="mt-5">
+        <ProjectHosting project={project} />
+      </div>
+
+      <div className="mt-auto space-y-3 pt-5">
         <p className="text-xs font-medium tracking-wide text-slate-500 uppercase">
-          Latest deployment
+          Active deployment
         </p>
-        {latest === null ? (
-          <p className="mt-1.5 text-sm text-slate-500">No deployments yet</p>
-        ) : (
-          <time
-            className="mt-1.5 block text-sm font-medium text-slate-700"
-            dateTime={latest.createdAt}
-          >
-            {formatDateTime(latest.createdAt)}
-          </time>
-        )}
+        <p className="font-mono text-xs text-slate-700">
+          {project.activeDeployment?.id ?? "—"}
+        </p>
+        <div>
+          <p className="text-xs font-medium tracking-wide text-slate-500 uppercase">
+            Latest deployment attempt
+          </p>
+          {latest === null ? (
+            <p className="mt-1.5 text-sm text-slate-500">No deployments yet</p>
+          ) : (
+            <div className="mt-1.5 flex flex-wrap items-center gap-2">
+              <span
+                className={`rounded-full border px-2.5 py-1 text-xs font-semibold ${DEPLOYMENT_STATUS_STYLES[latest.status]}`}
+              >
+                {DEPLOYMENT_STATUS_LABELS[latest.status]}
+              </span>
+              <time className="text-xs text-slate-700" dateTime={latest.createdAt}>
+                {formatDateTime(latest.createdAt)}
+              </time>
+            </div>
+          )}
+        </div>
         <Link
           className="mt-4 inline-flex text-sm font-semibold text-blue-700 hover:text-blue-800"
           href={`/projects/${project.id}`}

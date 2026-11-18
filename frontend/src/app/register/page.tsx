@@ -11,7 +11,7 @@ const VALID_PASSWORD_PATTERN = /^(?=.*[A-Za-z])(?=.*\d).{8,128}$/;
 
 export default function RegisterPage() {
   const router = useRouter();
-  const { register, status } = useAuth();
+  const { register, registrationEnabled, status } = useAuth();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -54,6 +54,23 @@ export default function RegisterPage() {
       setIsSubmitting(false);
     }
   };
+
+  if (registrationEnabled !== true) {
+    return (
+      <AuthShell
+        description={registrationEnabled === null
+          ? "Checking whether registration is enabled."
+          : "Sign in with an existing account or contact the DeployFlow operator."}
+        eyebrow="DeployFlow access"
+        footerHref="/login"
+        footerLabel="Sign in"
+        footerPrompt="Already have an account?"
+        title={registrationEnabled === null ? "Checking registration" : "Registration unavailable"}
+      >
+        {null}
+      </AuthShell>
+    );
+  }
 
   return (
     <AuthShell
@@ -129,6 +146,10 @@ export default function RegisterPage() {
         >
           {isSubmitting ? "Creating account…" : "Create account"}
         </button>
+        <p className="text-center text-xs leading-5 text-slate-500">
+          Registration may be disabled by the DeployFlow operator. Existing
+          accounts can still sign in.
+        </p>
       </form>
     </AuthShell>
   );

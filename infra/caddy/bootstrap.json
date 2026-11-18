@@ -1,0 +1,22 @@
+{
+  "admin": {
+    "listen": "unix//run/deployflow-caddy/admin.sock|0660",
+    "config": { "persist": false }
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "deployflow": {
+          "listen": ["127.0.0.1:8080"],
+          "automatic_https": { "disable": true },
+          "routes": [
+            {
+              "handle": [{ "handler": "static_response", "status_code": 404, "body": "Unknown host" }],
+              "terminal": true
+            }
+          ]
+        }
+      }
+    }
+  }
+}

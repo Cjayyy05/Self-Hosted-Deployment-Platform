@@ -21,6 +21,7 @@ type AuthContextValue = {
   token: string | null;
   status: AuthStatus;
   error: string | null;
+  registrationEnabled: boolean | null;
   login: (email: string, password: string) => Promise<void>;
   register: (email: string, password: string) => Promise<void>;
   logout: () => void;
@@ -34,6 +35,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null);
   const [status, setStatus] = useState<AuthStatus>("loading");
   const [error, setError] = useState<string | null>(null);
+  const [registrationEnabled, setRegistrationEnabled] = useState<boolean | null>(null);
 
   const clearSession = useCallback(() => {
     window.localStorage.removeItem(TOKEN_STORAGE_KEY);
@@ -87,6 +89,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => controller.abort();
   }, [restoreSession]);
 
+  useEffect(() => {
+    const controller = new AbortController();
+    void authApi.getFeatures(controller.signal).then(
+      (features) => {
+        if (!controller.signal.aborted) setRegistrationEnabled(features.registrationEnabled === true);
+      },
+      () => {
+        if (!controller.signal.aborted) setRegistrationEnabled(false);
+      },
+    );
+    return () => controller.abort();
+  }, []);
+
   const login = useCallback(async (email: string, password: string) => {
     const response = await authApi.login(email, password);
     window.localStorage.setItem(TOKEN_STORAGE_KEY, response.token);
@@ -110,12 +125,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       token,
       status,
       error,
+      registrationEnabled,
       login,
       register,
       logout: clearSession,
       retry: restoreSession,
     }),
-    [clearSession, error, login, register, restoreSession, status, token, user],
+    [clearSession, error, login, register, registrationEnabled, restoreSession, status, token, user],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

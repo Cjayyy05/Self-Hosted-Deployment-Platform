@@ -1,0 +1,8 @@
+[Unit]
+Description=DeployFlow image build limits
+
+[Slice]
+CPUQuota=100%
+MemoryMax=1536M
+MemorySwapMax=0
+TasksMax=256

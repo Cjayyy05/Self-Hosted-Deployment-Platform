@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+: "${DEPLOYFLOW_BACKUP_BUCKET:?Configure the private backup bucket}"
+: "${AWS_REGION:?Configure the backup region}"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+stage=$(mktemp -d /srv/deployflow/backup/staging.XXXXXXXX)
+trap 'rm -f -- "$stage/database.dump" "$stage/caddy.tar.gz" "$stage/SHA256SUMS"; rmdir -- "$stage"' EXIT
+
+runuser -u postgres -- pg_dump --format=custom --dbname=deployflow > "$stage/database.dump"
+tar -C /srv/deployflow -czf "$stage/caddy.tar.gz" caddy
+(cd "$stage" && sha256sum database.dump caddy.tar.gz > SHA256SUMS)
+for file in database.dump caddy.tar.gz SHA256SUMS; do
+    aws s3 cp "$stage/$file" "s3://$DEPLOYFLOW_BACKUP_BUCKET/deployflow/$stamp/$file" \
+        --region "$AWS_REGION" --sse AES256 --only-show-errors
+done

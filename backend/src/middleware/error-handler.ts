@@ -5,6 +5,7 @@ import { AppError } from '../utils/app-error.js';
 type ErrorBody = {
   error: {
     message: string;
+    code?: string;
   };
 };
 
@@ -16,7 +17,7 @@ export const errorHandler: ErrorRequestHandler = (
 ) => {
   if (error instanceof AppError) {
     response.status(error.statusCode).json({
-      error: { message: error.message },
+      error: { message: error.message, ...(error.code === undefined ? {} : { code: error.code }) },
     } satisfies ErrorBody);
     return;
   }

@@ -14,9 +14,25 @@ enum DeploymentStatus {
   CLONING
   BUILDING
   STARTING
+  HEALTHCHECKING
   RUNNING
   FAILED
   STOPPED
+}
+
+enum ApplicationType {
+  DOCKERFILE
+  NODE
+  PYTHON
+}
+
+enum RoutingOperation {
+  PROMOTE
+  ABORT
+  RETIRE
+  STOP
+  RESTART
+  DELETE
 }
 
 model User {
@@ -26,40 +42,110 @@ model User {
   createdAt    DateTime  @default(now())
   updatedAt    DateTime  @updatedAt
   projects     Project[]
+  publicApprovals ProjectPublicApproval[]
 }
 
 model Project {
-  id            String       @id @default(uuid()) @db.Uuid
-  userId        String       @db.Uuid
-  name          String       @db.VarChar(100)
-  repositoryUrl String
-  branch        String       @db.VarChar(255)
-  containerPort Int
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
-  user          User         @relation(fields: [userId], references: [id], onDelete: Cascade)
-  deployments   Deployment[]
+  id                String                  @id @default(uuid()) @db.Uuid
+  hostnameLabel     String                  @unique @db.VarChar(36)
+  userId            String                  @db.Uuid
+  name              String                  @db.VarChar(100)
+  repositoryUrl     String
+  branch            String                  @db.VarChar(255)
+  containerPort     Int
+  healthCheckPath   String                  @default("/") @db.VarChar(1024)
+  operationLockToken String?                @db.Uuid
+  operationLockExpiresAt DateTime?
+  activeDeploymentId String?               @db.Uuid
+  routingOperation   RoutingOperation?
+  routingDeploymentId String?              @db.Uuid
+  createdAt         DateTime                @default(now())
+  updatedAt         DateTime                @updatedAt
+  user              User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deployments       Deployment[]
+  activeDeployment  Deployment?             @relation("ActiveDeployment", fields: [id, activeDeploymentId], references: [projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  routingDeployment Deployment?             @relation("RoutingDeployment", fields: [id, routingDeploymentId], references: [projectId, id], onDelete: NoAction, onUpdate: NoAction)
+  webhookDeliveries GitHubWebhookDelivery[]
+  publicApproval    ProjectPublicApproval?
 
   @@index([userId])
+  @@index([operationLockExpiresAt])
+}
+
+model ProjectPublicApproval {
+  projectId     String                  @id @db.Uuid
+  repositoryUrl String
+  branch        String                  @db.VarChar(255)
+  approvedById  String                  @db.Uuid
+  approvedAt    DateTime                @default(now())
+  revokedAt     DateTime?
+  withdrawnAt   DateTime?
+  project       Project                 @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  approvedBy    User                    @relation(fields: [approvedById], references: [id], onDelete: Restrict)
+  revisions     ProjectPublicRevision[]
+}
+
+model PublicRoutingBinding {
+  id                    Int     @id
+  projectId             String? @db.Uuid
+  hostnameSuffix        String
+  adminSocketPath       String
+  routeGeneration       BigInt  @default(0)
+  routeRecoveryRequired Boolean @default(false)
+  nextWorkloadAddress   Int     @default(0)
+  ingressSocketPath     String  @default("/run/deployflow-ingress/auth.sock")
+  cutoverBootId         String? @db.Uuid
+}
+
+model ProjectPublicRevision {
+  projectId  String                @db.Uuid
+  commitHash String                @db.VarChar(40)
+  approvedAt DateTime              @default(now())
+  revokedAt  DateTime?
+  approval   ProjectPublicApproval @relation(fields: [projectId], references: [projectId], onDelete: Cascade)
+
+  @@id([projectId, commitHash])
+}
+
+model GitHubWebhookDelivery {
+  deliveryId String   @id @db.VarChar(255)
+  projectId  String   @db.Uuid
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@index([projectId])
+  @@index([createdAt])
 }
 
 model Deployment {
-  id           String           @id @default(uuid()) @db.Uuid
-  projectId    String           @db.Uuid
-  commitHash   String?          @db.VarChar(64)
-  status       DeploymentStatus @default(QUEUED)
-  containerId  String?
-  imageId      String?
-  imageTag     String?
-  hostPort     Int?
-  errorMessage String?
-  startedAt    DateTime?
-  finishedAt   DateTime?
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
-  project      Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  id                         String           @id @default(uuid()) @db.Uuid
+  projectId                  String           @db.Uuid
+  rollbackSourceDeploymentId String?          @db.Uuid
+  applicationType            ApplicationType?
+  commitHash                 String?          @db.VarChar(64)
+  status                     DeploymentStatus @default(QUEUED)
+  containerId                String?
+  imageId                    String?
+  imageTag                   String?
+  hostPort                   Int?
+  publicAddressIndex         Int?             @unique
+  buildNetworkId             String?          @unique
+  guardedBuild               Boolean          @default(false)
+  buildHostBootId            String?          @db.Uuid
+  buildEndedAt               DateTime?
+  errorMessage               String?
+  startedAt                  DateTime?
+  finishedAt                 DateTime?
+  createdAt                  DateTime         @default(now())
+  updatedAt                  DateTime         @updatedAt
+  project                    Project          @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  rollbackSource             Deployment?      @relation("DeploymentRollbacks", fields: [rollbackSourceDeploymentId], references: [id], onDelete: SetNull)
+  rollbacks                  Deployment[]     @relation("DeploymentRollbacks")
+  activeFor                  Project[]        @relation("ActiveDeployment")
+  routingFor                 Project[]        @relation("RoutingDeployment")
 
+  @@unique([projectId, id])
   @@index([projectId])
   @@index([status])
+  @@index([rollbackSourceDeploymentId])
 }
-

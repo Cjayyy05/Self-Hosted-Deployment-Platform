@@ -10,6 +10,15 @@ import {
   type DockerBuildOutput,
 } from '../src/services/docker-build.service.js';
 
+const mode = vi.hoisted(() => ({ public: false }));
+
+vi.mock('../src/config/env.js', async (importOriginal) => {
+  const module = await importOriginal<typeof import('../src/config/env.js')>();
+  return { ...module, env: { ...module.env, get hosting() {
+    return mode.public ? { ...module.env.hosting, publicHosting: { operatorId: 'fixture' } } : module.env.hosting;
+  } } };
+});
+
 const projectId = '11111111-1111-4111-8111-111111111111';
 const deploymentId = '22222222-2222-4222-8222-222222222222';
 const imageId = `sha256:${'a'.repeat(64)}`;
@@ -34,6 +43,7 @@ describe('DockerBuildService', () => {
   let removeImage: ReturnType<typeof vi.fn>;
 
   beforeEach(async () => {
+    mode.public = false;
     repositoryDirectory = await mkdtemp(join(tmpdir(), 'deployflow-build-'));
     await writeFile(join(repositoryDirectory, 'Dockerfile'), 'FROM scratch\n');
     buildStream = new PassThrough();
@@ -112,7 +122,28 @@ describe('DockerBuildService', () => {
       { error: 'executor failed running [/bin/sh]' },
     ]);
     expect(docker.getImage).toHaveBeenCalledWith(imageTag);
-    expect(removeImage).toHaveBeenCalledWith({ force: true });
+    expect(removeImage).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
+  });
+
+  it('serializes and limits Linux builds with public mode enabled and zero approvals', async () => {
+    mode.public = true;
+    let finish: FinishedHandler | undefined;
+    const docker = createDocker((_stream, callback) => { finish = callback; });
+    const service = new DockerBuildService(docker);
+    const buildNetworkId = 'a'.repeat(64);
+    const build = service.buildImage({ repositoryDirectory, projectId, deploymentId, buildNetworkId });
+    try {
+      await expect(service.buildImage({ repositoryDirectory, projectId, deploymentId, buildNetworkId }))
+        .rejects.toMatchObject({ statusCode: 409 });
+      await vi.waitFor(() => { expect(finish).toBeDefined(); });
+      expect(docker.buildImage.mock.calls[0]?.[1]).toMatchObject({
+        version: '1', memory: 1536 * 1024 * 1024, memswap: 1536 * 1024 * 1024,
+        cpuperiod: 100_000, cpuquota: 100_000, networkmode: buildNetworkId, cgroupparent: 'deployflow-build.slice',
+      });
+    } finally {
+      finish?.(null, [{ aux: { ID: imageId } }]);
+      await build;
+    }
   });
 
   it('converts a Docker daemon rejection and tolerates absent partial images', async () => {
@@ -128,7 +159,7 @@ describe('DockerBuildService', () => {
       statusCode: 422,
       message: 'Docker image build failed',
     });
-    expect(removeImage).toHaveBeenCalledWith({ force: true });
+    expect(removeImage).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
   });
 
   it('turns output callback failures into a structured error and cleans up', async () => {
@@ -150,7 +181,7 @@ describe('DockerBuildService', () => {
       statusCode: 500,
       message: 'Docker build output handler failed',
     });
-    expect(removeImage).toHaveBeenCalledWith({ force: true });
+    expect(removeImage).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
   });
 
   it('removes a deployment image explicitly for orchestration cleanup', async () => {
@@ -160,6 +191,31 @@ describe('DockerBuildService', () => {
     await expect(service.removeImage(imageTag)).resolves.toBeUndefined();
 
     expect(docker.getImage).toHaveBeenCalledWith(imageTag);
-    expect(removeImage).toHaveBeenCalledWith({ force: true });
+    expect(removeImage).toHaveBeenCalledWith({ force: true, abortSignal: expect.any(AbortSignal) as unknown });
+  });
+
+  it('checks whether a rollback image is still available', async () => {
+    const docker = createDocker(() => undefined);
+    const service = new DockerBuildService(docker);
+
+    await expect(service.imageExists(imageId)).resolves.toBe(true);
+    expect(docker.getImage).toHaveBeenCalledWith(imageId);
+  });
+
+  it('reports a missing rollback image without treating it as a Docker failure', async () => {
+    const docker = createDocker(() => undefined);
+    docker.getImage.mockReturnValueOnce({
+      inspect: vi.fn().mockRejectedValue({ statusCode: 404 }),
+      remove: removeImage,
+    });
+    const service = new DockerBuildService(docker);
+
+    await expect(service.imageExists(imageId)).resolves.toBe(false);
+  });
+
+  it('rejects an inspected rollback image whose ID differs from the recorded immutable ID', async () => {
+    const docker = createDocker(() => undefined);
+    const service = new DockerBuildService(docker);
+    await expect(service.imageExists('sha256:' + 'b'.repeat(64))).resolves.toBe(false);
   });
 });

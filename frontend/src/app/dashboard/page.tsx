@@ -1,49 +1,35 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { CreateProjectForm } from "@/components/create-project-form";
-import {
-  ProjectCard,
-  type ProjectWithLatestDeployment,
-} from "@/components/project-card";
+import { ProjectCard } from "@/components/project-card";
 import { ProjectListSkeleton } from "@/components/project-list-skeleton";
 import { useAuth } from "@/context/auth-context";
-import { ApiError, projectApi } from "@/lib/api";
+import { ApiError, PROJECT_REFRESH_INTERVAL_MS, projectApi, type Project } from "@/lib/api";
 
 export default function DashboardPage() {
   const { logout, token, user } = useAuth();
-  const [projects, setProjects] = useState<ProjectWithLatestDeployment[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isCreateOpen, setIsCreateOpen] = useState(false);
+  const requestId = useRef(0);
 
   const loadProjects = useCallback(
-    async (signal?: AbortSignal) => {
+    async (signal?: AbortSignal, showLoading = true) => {
       if (token === null) return;
 
-      setIsLoading(true);
-      setError(null);
+      const id = ++requestId.current;
+      if (showLoading) setIsLoading(true);
 
       try {
         const projectList = await projectApi.list(token, signal);
-        const projectsWithDeployments = await Promise.all(
-          projectList.map(async (project) => {
-            const deployments = await projectApi.listDeployments(
-              token,
-              project.id,
-              signal,
-            );
-            return {
-              ...project,
-              latestDeployment: deployments[0] ?? null,
-            } satisfies ProjectWithLatestDeployment;
-          }),
-        );
-
-        setProjects(projectsWithDeployments);
+        if (signal?.aborted || id !== requestId.current) return;
+        setProjects(projectList);
+        setError(null);
       } catch (requestError: unknown) {
-        if (signal?.aborted === true) return;
+        if (signal?.aborted || id !== requestId.current) return;
 
         if (requestError instanceof ApiError && requestError.status === 401) {
           logout();
@@ -56,7 +42,7 @@ export default function DashboardPage() {
             : "Unable to load your projects.",
         );
       } finally {
-        if (signal?.aborted !== true) setIsLoading(false);
+        if (!signal?.aborted && id === requestId.current) setIsLoading(false);
       }
     },
     [logout, token],
@@ -64,10 +50,19 @@ export default function DashboardPage() {
 
   useEffect(() => {
     const controller = new AbortController();
-    queueMicrotask(() => {
-      if (!controller.signal.aborted) void loadProjects(controller.signal);
-    });
-    return () => controller.abort();
+    let timer: number;
+    const refresh = async (initial = false) => {
+      if (controller.signal.aborted) return;
+      if (initial || !document.hidden) await loadProjects(controller.signal, initial);
+      if (!controller.signal.aborted) {
+        timer = window.setTimeout(() => void refresh(), PROJECT_REFRESH_INTERVAL_MS);
+      }
+    };
+    queueMicrotask(() => void refresh(true));
+    return () => {
+      controller.abort();
+      window.clearTimeout(timer);
+    };
   }, [loadProjects]);
 
   const handleProjectCreated = async () => {
@@ -85,8 +80,7 @@ export default function DashboardPage() {
               Your projects
             </h1>
             <p className="mt-3 max-w-2xl text-sm leading-6 text-slate-600">
-              Welcome back, {user?.email}. Review repository configuration and the
-              latest deployment state for each project.
+              Welcome back, {user?.email}. Review hosting and deployment status for each project.
             </p>
           </div>
           <button

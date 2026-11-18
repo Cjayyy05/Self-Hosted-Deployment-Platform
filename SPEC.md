@@ -2,17 +2,17 @@
 
 ## Project purpose
 
-DeployFlow is a self-hosted deployment platform for trusted, public GitHub repositories that contain a Dockerfile. It will build a repository into a Docker image, run the application in a Docker container, and provide deployment management and monitoring from a web interface.
+DeployFlow is a self-hosted deployment platform for trusted, public GitHub repositories. It builds a repository into a Docker image, runs the application in a Docker container, and provides deployment management and monitoring from a web interface. A root Dockerfile is preferred, while a conservative set of Dockerfile-free Node.js and Python web applications can use a temporary generated Dockerfile.
 
-This repository currently contains the backend foundation, PostgreSQL persistence schema, JWT-based authentication, authenticated project management, an internal GitHub repository preparation service, and an internal Docker image build service. Container execution and the frontend are future milestones.
+DeployFlow includes Docker deployment and a management dashboard. Optional local hosting serves healthy deployments through Caddy using a stable project hostname.
 
 ## MVP requirements
 
 The completed MVP should support:
 
 - User registration and login.
-- Deployment projects with a public GitHub repository URL, Git branch, and application container port.
-- Cloning public repositories and verifying that a Dockerfile exists.
+- Deployment projects with a public GitHub repository URL, Git branch, application container port, and application-relative health-check path.
+- Cloning public repositories and preparing an existing or safely generated Dockerfile.
 - Building a Docker image and starting a container.
 - Assigning an available host port.
 - Displaying deployment state and build/runtime logs.
@@ -25,24 +25,72 @@ The completed MVP should support:
 1. An authenticated user creates a project and supplies a public GitHub repository URL, branch, and container port.
 2. DeployFlow validates the input and creates a deployment record.
 3. The backend clones the selected branch into an isolated working directory.
-4. The backend verifies that the repository contains a Dockerfile.
-5. Docker builds an image while build state and logs are streamed to the user.
+4. The backend uses a root Dockerfile when present. Otherwise it detects a supported npm-based Node.js application or a supported Flask, FastAPI, or Streamlit application and generates a Dockerfile only in the temporary clone.
+5. Docker builds an image while build state and logs are streamed to the user. Dependency installation and repository-provided npm or Python build steps run only inside Docker.
 6. DeployFlow selects an available host port and starts the application container.
-7. The backend records the outcome and exposes state, logs, and basic runtime metrics.
-8. The user can stop, restart, or redeploy the application; each deployment is retained in history.
+7. The deployment enters `HEALTHCHECKING`. DeployFlow repeatedly requests the project's configured path through the new container's localhost host port, using bounded retries and per-request timeouts.
+8. Only an HTTP response from 200 through 399 marks the deployment `RUNNING`. An unhealthy application fails and its new container is cleaned up.
+9. The backend records the outcome and exposes state, logs, and basic runtime metrics.
+10. The user can stop, restart, or redeploy the application; each deployment is retained in history.
 
 ## Supported repository assumptions
 
 - Repositories are public GitHub repositories.
 - Repositories are trusted test projects controlled or reviewed by the DeployFlow operator.
-- A Dockerfile exists at the expected repository location.
-- The Dockerfile produces a runnable application image.
+- A valid root Dockerfile exists, or the repository matches one of the supported automatic detection modes below.
+- An existing or generated Dockerfile produces a runnable application image.
 - The user supplies the correct branch and internal application port.
+- The configured health-check path returns a successful HTTP response when the application is ready. The default path is `/`.
 - A single Docker host has enough resources to build and run the project.
+
+## Automatic application detection
+
+Detection is ordered and conservative:
+
+1. A regular root `Dockerfile` always uses the repository's existing Dockerfile unchanged.
+2. A regular root `package.json` selects Node.js detection. The file must be valid JSON with a non-empty `scripts.start` string. npm is used; `package-lock.json` selects `npm ci`, otherwise `npm install` is used. A non-empty `scripts.build` adds `npm run build` to the image build.
+3. A regular root `requirements.txt` or a standard PEP 621 `pyproject.toml` selects Python detection. A pip-installable `pyproject.toml` must contain `[project]` dependencies and `[build-system]` metadata.
+4. All other repositories fail with `Unsupported application type`; DeployFlow does not guess a launch command.
+
+Supported Python layouts are intentionally narrow:
+
+- Flask: root `app.py`, a Flask dependency, and a root `app = Flask(...)` application. Gunicorn is used when declared; otherwise the Flask module runner is used.
+- FastAPI: root `main.py`, FastAPI and Uvicorn dependencies, and a root `app = FastAPI(...)` application.
+- Streamlit: root `app.py` and a Streamlit dependency.
+
+Generated Node.js images use Node 22 on Debian slim, set `HOST=0.0.0.0` and `PORT` to the configured container port, and start with `npm start`. The application must honor those conventional environment variables. Generated Python images use Python 3.13 slim and install from `requirements.txt` or the repository's standard project metadata. Generated launch commands bind supported Python applications to `0.0.0.0` on the project's configured container port. Generated Dockerfiles exist only inside DeployFlow's temporary clone and are deleted with that directory after the build workflow.
+
+## Application health checks
+
+Each project has an application-relative health-check path, defaulting to `/`. Paths such as `/health` and `/api/health` are accepted. Absolute URLs, protocol-relative paths, query strings, fragments, backslashes, control characters, and malformed encodings are rejected.
+
+Workload health checks target the assigned IPv4 loopback address and port. DeployFlow allocates a deployment-specific address in public mode and uses `127.0.0.1` with a dynamically assigned port in private mode. DeployFlow does not follow redirects or accept a configurable health-check host. Workload checks use a two-second request timeout and retry up to 20 times with a one-second delay.
+
+The successful lifecycle is `QUEUED → CLONING → BUILDING → STARTING → HEALTHCHECKING → RUNNING`. Restart also passes through `STARTING → HEALTHCHECKING → RUNNING`. During redeploy and rollback, the existing running deployment remains available until its replacement passes health checking. A failed check marks only the replacement `FAILED`, cleans its container and incomplete image where appropriate, and leaves the working deployment running.
+
+With local hosting enabled, a candidate also needs a verified route and successful request through the project hostname before PostgreSQL commits it as the active deployment. The committed deployment and any unfinished routing operation are stored on the project. Recovery uses this state to restore routes and resolves pending operations before stopping any container that could still be serving traffic.
 
 ## Security limitations
 
+DeployFlow currently assumes deployment repositories are trusted. It is not designed to safely execute arbitrary untrusted public code.
+
 This portfolio MVP is not a secure multi-tenant sandbox. Building and running repository code can give that code access to compute, network, and other resources made available to Docker. Only trusted test repositories may be deployed. Production use would require stronger isolation, resource limits, network controls, image and dependency scanning, secret management, audit logging, rate limits, and host hardening.
+
+Docker provides useful process and filesystem isolation, but DeployFlow does not treat it as a hardened arbitrary-code sandbox. Registration is disabled by default, the backend binds to `127.0.0.1` by default, and deployed application ports are published only on IPv4 loopback. Operators may explicitly change the backend bind host in private mode, but should place authentication, TLS, and network access controls in front of any non-local deployment.
+
+State-changing deployment operations use a renewable, database-backed per-project lease. Concurrent Deploy, Stop, Restart, Redeploy, Rollback, delete, and webhook-triggered replacement requests for one project are rejected while another operation holds the lease. Expired leases can be replaced so a crashed process does not permanently block a project.
+
+In Linux public hosting mode, the configured operator UUID grants management access through the private API and Socket.IO. New projects start unapproved. The operator records the immutable GitHub source and full SHA approvals in PostgreSQL, and selects an approved SHA for deploy and redeploy. Restart and rollback use the deployment's stored SHA. Approval mutations use the same project lease. Each approved project can publish independently through its stable `app-<project-uuid-without-hyphens>.<APP_HOSTNAME_SUFFIX>` hostname. Each application container listens through its own reserved loopback binding.
+
+Caddy starts with deny-only routes for HTTP and HTTPS. An approved deployment's exact host matcher activates Caddy's automatic certificate management and HTTP redirect. DeployFlow validates public A and AAAA answers against the configured shared IPv4 DNS reference, then requires trusted TLS and a deployment-specific health response through Caddy before committing the replacement. The browser also checks that route from the operator's network before it offers the public link. A failed replacement restores the previous verified Docker target when it is healthy.
+
+The independently reviewed full SHA is authoritative for checkout. The branch records review context and must match the project source. Revocation denies new workload starts and new ingress requests. Completion requires verified Caddy withdrawal, confirmed removal of owned runtime containers, and terminal evidence for each outstanding Docker build. The backend journals each public build's Docker network before submission. Recovery tears down that network and retains the journal if execution cannot be confirmed to have ended.
+
+Public Caddy writes use a PostgreSQL-allocated generation in the live route list. A reset to the deny-only bootstrap must establish a new generation before an application can be published. Each public deployment receives a dedicated loopback address that DeployFlow never reassigns and uses a privileged host port. The Caddy data plane checks durable authorization through a private Unix socket. Startup verifies Docker inventory and the managed Linux backend holds a host-local lifetime gate in addition to its PostgreSQL session lock.
+
+First public admission is a maintenance transition. With existing writers offline, the operator records the current Linux boot ID and reboots. Startup requires a different kernel boot ID and a deny-only Caddy route list before recording admission. An approved legacy container may remain privately available for replacement and is removed by verified ownership after promotion. Ambiguous journaled builds pause work in their own project and require a clean builder response or a different boot before their records can be cleared.
+
+Historical container logs use a bounded default tail and response size. DeployFlow-created containers use Docker's `json-file` log driver with rotation. Old deployment history is preserved, while deleting a project first removes the containers and project-specific image tags known through that history.
 
 Secrets must never be committed or hardcoded. Runtime configuration must be supplied through environment variables.
 

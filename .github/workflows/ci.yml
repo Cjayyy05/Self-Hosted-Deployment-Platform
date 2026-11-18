@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - stretch-features
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend quality checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://deployflow_ci:deployflow_ci@localhost:5432/deployflow_ci?schema=public
+      JWT_SECRET: ci-only-jwt-secret-with-at-least-thirty-two-bytes
+      JWT_EXPIRES_IN: 1h
+      REGISTRATION_ENABLED: "true"
+      GITHUB_WEBHOOK_SECRET_KEY: ci-only-webhook-key-with-at-least-thirty-two-bytes
+      PUBLIC_BASE_URL: http://localhost:4000
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install backend dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npm run prisma:generate
+
+      - name: Validate Prisma schema
+        run: npm run prisma:validate
+
+      - name: Check backend TypeScript
+        run: npm run typecheck
+
+      - name: Lint backend
+        run: npm run lint
+
+      - name: Run backend tests
+        run: npm test
+
+      - name: Build backend
+        run: npm run build
+
+      - name: Verify Linux hosting with Docker, Caddy and disposable PostgreSQL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-16
+          sudo pg_conftool 16 main set port 55437
+          sudo systemctl restart postgresql@16-main
+          sudo -u postgres psql -p 55437 -v ON_ERROR_STOP=1 -c "CREATE ROLE deployflow_fixture LOGIN PASSWORD 'phase5b-disposable-only'"
+          sudo -u postgres createdb -p 55437 -O deployflow_fixture deployflow_phase5b
+          sudo -u postgres createdb -p 55437 -O deployflow_fixture deployflow_phase1
+          DEPLOYFLOW_PHASE1_TEST_DB=postgresql://deployflow_fixture:phase5b-disposable-only@127.0.0.1:55437/deployflow_phase1 npm exec -- vitest run tests/public-approval.integration.test.ts
+          asset=caddy_2.11.9_linux_amd64.tar.gz
+          release=https://github.com/caddyserver/caddy/releases/download/v2.11.9
+          curl -fsSLO "$release/$asset"
+          curl -fsSLO "$release/caddy_2.11.9_checksums.txt"
+          grep " $asset$" caddy_2.11.9_checksums.txt | sha512sum -c -
+          sudo tar -xzf "$asset" -C /usr/local/bin caddy
+          sudo install -m 0644 ../infra/ubuntu/deployflow-build.slice /etc/systemd/system/
+          sudo systemctl daemon-reload
+          sudo env "PATH=$PATH" DEPLOYFLOW_DISPOSABLE_LINUX=1 bash ../infra/ubuntu/prepare-linux-smoke
+
+  frontend:
+    name: Frontend quality checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Check frontend TypeScript
+        run: npm run typecheck
+
+      - name: Lint frontend
+        run: npm run lint
+
+      - name: Build frontend
+        run: npm run build

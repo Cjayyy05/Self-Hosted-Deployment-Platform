@@ -5,7 +5,9 @@ import { type Ignore } from '@balena/dockerignore';
 import Dockerode from 'dockerode';
 import tar from 'tar-fs';
 
+import { env } from '../config/env.js';
 import { AppError } from '../utils/app-error.js';
+import { dockerDeadline } from './docker-deadline.js';
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -17,6 +19,9 @@ export type DockerBuildInput = {
   repositoryDirectory: string;
   projectId: string;
   deploymentId: string;
+  buildNetworkId?: string;
+  confirmTerminal?: () => Promise<void>;
+  markSubmitted?: () => void;
 };
 
 export type DockerBuildOutput = {
@@ -35,18 +40,30 @@ export type DockerBuildResult = {
 
 type DockerImage = {
   inspect: () => Promise<{ Id: string }>;
-  remove: (options: { force: boolean }) => Promise<unknown>;
+  remove: (options: { force: boolean; abortSignal?: AbortSignal }) => Promise<unknown>;
 };
+
+const isDockerNotFoundError = (error: unknown): boolean =>
+  isRecord(error) && error.statusCode === 404;
 
 type DockerBuildOptions = {
   dockerfile: string;
   t: string;
   rm: boolean;
   forcerm: boolean;
+  version?: '1';
+  memory?: number;
+  memswap?: number;
+  cpuperiod?: number;
+  cpuquota?: number;
+  networkmode?: string;
+  abortSignal?: AbortSignal;
+  cgroupparent?: string;
 };
 
 type DockerBuildStream = NodeJS.ReadableStream & {
   destroy: () => void;
+  readableEnded?: boolean;
 };
 
 type DockerClient = {
@@ -204,9 +221,11 @@ const validateRepositoryDirectory = async (
 
 export class DockerBuildService {
   readonly #docker: DockerClient;
+  #building = false;
 
   public constructor(
     docker: DockerClient = new Dockerode() as unknown as DockerClient,
+    private readonly linuxHosting = env.hosting.publicHosting !== undefined,
   ) {
     this.#docker = docker;
   }
@@ -214,6 +233,24 @@ export class DockerBuildService {
   public async buildImage(
     input: DockerBuildInput,
     onOutput?: DockerBuildOutputCallback,
+  ): Promise<DockerBuildResult> {
+    if (!this.linuxHosting) return this.#buildImage(input, onOutput);
+    if (!/^[a-f0-9]{64}$/.test(input.buildNetworkId ?? '')) {
+      throw new AppError(503, 'Public builds require a recorded Docker network');
+    }
+    if (this.#building) throw new AppError(409, 'Another image build is already running');
+    this.#building = true;
+    try {
+      return await dockerDeadline(({ abortSignal }) => this.#buildImage(input, onOutput, abortSignal), 10 * 60_000);
+    } finally {
+      this.#building = false;
+    }
+  }
+
+  async #buildImage(
+    input: DockerBuildInput,
+    onOutput?: DockerBuildOutputCallback,
+    signal?: AbortSignal,
   ): Promise<DockerBuildResult> {
     const projectId = parseIdentifier(input.projectId, 'Project ID');
     const deploymentId = parseIdentifier(input.deploymentId, 'Deployment ID');
@@ -223,32 +260,44 @@ export class DockerBuildService {
     const imageTag = `deployflow/project-${projectId}/deployment-${deploymentId}`;
     const context = await createBuildContext(repositoryDirectory);
     let buildStream: DockerBuildStream | undefined;
+    const abortBuild = () => buildStream?.destroy();
 
     try {
+      signal?.throwIfAborted();
+      input.markSubmitted?.();
       const activeBuildStream = await this.#docker.buildImage(context, {
         dockerfile: DOCKERFILE_NAME,
         t: imageTag,
         rm: true,
         forcerm: true,
+        // The classic API applies these limits to RUN containers. The
+        // deployflow-build systemd slice also bounds aggregate build tasks.
+        ...(this.linuxHosting && signal !== undefined && input.buildNetworkId !== undefined ? {
+          version: '1',
+          memory: 1536 * 1024 * 1024,
+          memswap: 1536 * 1024 * 1024,
+          cpuperiod: 100_000,
+          cpuquota: 100_000,
+          networkmode: input.buildNetworkId,
+          abortSignal: signal,
+          cgroupparent: 'deployflow-build.slice',
+        } as const : {}),
       });
       buildStream = activeBuildStream;
+      signal?.addEventListener('abort', abortBuild, { once: true });
+      signal?.throwIfAborted();
 
       let buildFailure = false;
 
-      await new Promise<void>((resolve, reject) => {
+      const failed = await new Promise<boolean>((resolve, reject) => {
         this.#docker.modem.followProgress(
           activeBuildStream,
           (error, result) => {
-            if (
-              error !== null ||
-              buildFailure ||
-              result.some((output) => normalizeBuildOutput(output).error !== undefined)
-            ) {
+            if (error !== null) {
               reject(new AppError(422, 'Docker image build failed'));
               return;
             }
-
-            resolve();
+            resolve(buildFailure || result.some((output) => normalizeBuildOutput(output).error !== undefined));
           },
           (rawOutput) => {
             const output = normalizeBuildOutput(rawOutput);
@@ -263,7 +312,12 @@ export class DockerBuildService {
         );
       });
 
-      const image = await this.#docker.getImage(imageTag).inspect();
+      if (input.confirmTerminal !== undefined) {
+        if (activeBuildStream.readableEnded !== true || signal?.aborted) throw new AppError(503, 'Docker build outcome is unknown');
+        await input.confirmTerminal();
+      }
+      if (failed) throw new AppError(422, 'Docker image build failed');
+      const image = await dockerDeadline(() => this.#docker.getImage(imageTag).inspect());
 
       if (!IMAGE_ID_PATTERN.test(image.Id)) {
         throw new AppError(500, 'Docker returned an invalid image ID');
@@ -279,6 +333,7 @@ export class DockerBuildService {
 
       throw new AppError(422, 'Docker image build failed');
     } finally {
+      signal?.removeEventListener('abort', abortBuild);
       context.destroy();
       buildStream?.destroy();
     }
@@ -296,17 +351,35 @@ export class DockerBuildService {
     }
 
     try {
-      await this.#docker
-        .getImage(normalizedIdentifier)
-        .remove({ force: true });
+      await dockerDeadline((options) => this.#docker.getImage(normalizedIdentifier).remove({ ...options, force: true }));
     } catch {
       throw new AppError(422, 'Unable to remove Docker image');
     }
   }
 
+  public async imageExists(imageIdentifier: string): Promise<boolean> {
+    const normalizedIdentifier = imageIdentifier.trim();
+
+    if (
+      normalizedIdentifier.length === 0 ||
+      normalizedIdentifier.length > MAX_IMAGE_IDENTIFIER_LENGTH ||
+      /\s/.test(normalizedIdentifier)
+    ) {
+      throw new AppError(400, 'Image identifier is invalid');
+    }
+
+    try {
+      const inspected = await dockerDeadline(() => this.#docker.getImage(normalizedIdentifier).inspect());
+      return !/^sha256:[a-f0-9]{64}$/.test(normalizedIdentifier) || inspected.Id === normalizedIdentifier;
+    } catch (error: unknown) {
+      if (isDockerNotFoundError(error)) return false;
+      throw new AppError(503, 'Unable to inspect Docker image');
+    }
+  }
+
   async #removePartialImage(imageTag: string): Promise<void> {
     try {
-      await this.#docker.getImage(imageTag).remove({ force: true });
+      await dockerDeadline((options) => this.#docker.getImage(imageTag).remove({ ...options, force: true }));
     } catch {
       // A failed build may not have created an image to remove.
     }

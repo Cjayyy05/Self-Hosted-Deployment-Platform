@@ -1,5 +1,7 @@
 import { AppError } from './app-error.js';
+import { parseGitBranch, parsePublicCommit } from './git-revision.js';
 import { parseGitHubRepositoryUrl } from './github-repository.js';
+import { parseHealthCheckPath } from './health-check-path.js';
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -9,6 +11,7 @@ type ProjectInput = {
   repositoryUrl: string;
   branch: string;
   containerPort: number;
+  healthCheckPath: string;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -30,15 +33,7 @@ export const parseProjectInput = (body: unknown): ProjectInput => {
   }
 
   const { repositoryUrl } = parseGitHubRepositoryUrl(body.repositoryUrl);
-  const branch = body.branch === undefined ? 'main' : body.branch;
-
-  if (
-    typeof branch !== 'string' ||
-    branch.trim().length === 0 ||
-    branch.length > 255
-  ) {
-    throw new AppError(400, 'Branch must be between 1 and 255 characters');
-  }
+  const branch = parseGitBranch(body.branch === undefined ? 'main' : body.branch);
 
   if (
     typeof body.containerPort !== 'number' ||
@@ -52,9 +47,39 @@ export const parseProjectInput = (body: unknown): ProjectInput => {
   return {
     name,
     repositoryUrl,
-    branch: branch.trim(),
+    branch,
     containerPort: body.containerPort,
+    healthCheckPath: parseHealthCheckPath(body.healthCheckPath),
   };
+};
+
+export const parseApprovalInput = (body: unknown) => {
+  if (!isRecord(body)) throw new AppError(400, 'Request body must be a JSON object');
+  return {
+    repositoryUrl: parseGitHubRepositoryUrl(body.repositoryUrl).repositoryUrl.toLowerCase(),
+    branch: parseGitBranch(body.branch),
+    commitHash: parsePublicCommit(body.commitHash),
+  };
+};
+
+export const parseDeploymentCommit = (body: unknown): string | undefined => {
+  if (body === undefined) return undefined;
+  if (!isRecord(body)) throw new AppError(400, 'Request body must be a JSON object');
+  return body.commitHash === undefined ? undefined : parsePublicCommit(body.commitHash);
+};
+
+export const parseProjectHealthCheckInput = (
+  body: unknown,
+): { healthCheckPath: string } => {
+  if (!isRecord(body)) {
+    throw new AppError(400, 'Request body must be a JSON object');
+  }
+
+  if (body.healthCheckPath === undefined) {
+    throw new AppError(400, 'Health-check path is required');
+  }
+
+  return { healthCheckPath: parseHealthCheckPath(body.healthCheckPath) };
 };
 
 export const parseProjectId = (value: unknown): string => {

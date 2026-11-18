@@ -2,29 +2,43 @@
 
 ## Requirements
 
-- Node.js 20 or newer.
+- Node.js 22, matching CI.
 - npm.
 - PostgreSQL.
 
 ## Run locally
 
+Copy `.env.example` to `.env` in `backend` before installing. Set `DATABASE_URL` to your local PostgreSQL database and replace `JWT_SECRET`.
+
 From the repository root:
 
 ```bash
 cd backend
-npm install
-copy .env.example .env
-```
-
-On macOS or Linux, replace `copy .env.example .env` with `cp .env.example .env`.
-Update `DATABASE_URL` in `.env` with the credentials for your local PostgreSQL database, then apply the committed migrations and start the API:
-
-```bash
+npm ci
 npm run prisma:migrate:deploy
 npm run dev
 ```
 
 Replace `JWT_SECRET` with a cryptographically random secret of at least 32 characters. `JWT_EXPIRES_IN` controls access-token lifetime and defaults to `1h`.
+
+Generate independent JWT and GitHub webhook secrets in PowerShell with:
+
+```powershell
+[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))
+```
+
+Run the command separately for each secret. Placeholder or obviously weak values are rejected outside the test environment, and secret values are never printed by DeployFlow.
+
+Registration and network binding are controlled with:
+
+```env
+REGISTRATION_ENABLED=false
+BIND_HOST=127.0.0.1
+```
+
+Registration is disabled by default. To create the first local account, temporarily set `REGISTRATION_ENABLED=true`, restart the backend, register the account, then restore it to `false` and restart again. Existing users can continue to log in while registration is disabled. The backend and deployed application ports are loopback-only by default.
+
+DeployFlow currently assumes deployment repositories are trusted. It is not designed to safely execute arbitrary untrusted public code. Docker provides isolation, but is not treated as a hardened arbitrary-code sandbox.
 
 `containerPort` is the port the deployed application listens on inside its future Docker container. It must be supplied by the user and is not inferred by DeployFlow.
 
@@ -52,12 +66,12 @@ Passwords must contain 8 to 128 characters, including at least one letter and on
 
 All project endpoints require `Authorization: Bearer <token>`:
 
-- `POST /api/projects` creates a project from `name`, `repositoryUrl`, optional `branch`, and `containerPort`.
+- `POST /api/projects` creates a project from `name`, `repositoryUrl`, optional `branch`, `containerPort`, and optional `healthCheckPath`.
 - `GET /api/projects` lists the authenticated user's projects.
 - `GET /api/projects/:id` returns an owned project.
 - `DELETE /api/projects/:id` deletes an owned project.
 
-The branch defaults to `main`. Repository URLs must use the form `https://github.com/<owner>/<repository>`, and `containerPort` must be an integer from 1 through 65535 representing the application's internal container port. Repository cloning is not implemented yet.
+The branch defaults to `main` and the health-check path defaults to `/`. Repository URLs use the form `https://github.com/<owner>/<repository>`. The backend clones the repository when a deployment begins.
 
 ## Quality checks
 

@@ -1,0 +1,24 @@
+#!/bin/bash
+set -euo pipefail
+
+# Run only against a dedicated Ubuntu VM or WSL2 distro and its own daemon/cluster.
+if [[ $EUID != 0 || ${DEPLOYFLOW_DISPOSABLE_LINUX:-} != 1 ]]; then
+    echo 'Run as root in an explicitly disposable Linux environment.' >&2
+    exit 1
+fi
+
+source_dir=$(cd "$(dirname "$0")/../.." && pwd)
+cd "$source_dir/backend"
+install -d -m 0700 /var/tmp/deployflow-phase5b
+export DEPLOYFLOW_PHASE5B_SMOKE=1
+export DEPLOYFLOW_PHASE5B_DB=postgresql://deployflow_fixture:phase5b-disposable-only@127.0.0.1:55437/deployflow_phase5b
+export NODE_EXTRA_CA_CERTS=/var/tmp/deployflow-phase5b/server.crt
+openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+    -subj '/CN=DeployFlow Disposable Test CA' -addext basicConstraints=critical,CA:TRUE \
+    -addext keyUsage=critical,keyCertSign,cRLSign \
+    -keyout /var/tmp/deployflow-phase5b/server.key -out "$NODE_EXTRA_CA_CERTS" 2>/dev/null
+
+systemctl start deployflow-build.slice
+docker pull busybox:1.37.0-glibc
+DATABASE_URL="$DEPLOYFLOW_PHASE5B_DB" npm run prisma:migrate:deploy
+npm exec -- vitest run --no-cache tests/public-hosting-linux.integration.test.ts
